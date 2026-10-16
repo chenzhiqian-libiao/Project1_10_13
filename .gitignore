@@ -1,0 +1,37 @@
+# Visual Studio and VisualGDB local caches
+.vs/
+.visualgdb/
+VisualGDB/
+TraceReports/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Build output and temporary files
+[Bb]in/
+[Oo]bj/
+[Dd]ebug/
+[Rr]elease/
+*.o
+*.obj
+*.elf
+*.axf
+*.bin
+*.hex
+*.map
+*.d
+*.dep
+*.alldeps
+*.rsp
+*.dwarfcache
+*.log
+*.tmp
+
+# Local credentials
+.env
+.env.*
+!.env.example
+*.pfx
+*.p12
+*.key
