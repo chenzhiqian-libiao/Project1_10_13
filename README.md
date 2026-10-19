@@ -61,12 +61,31 @@ SPI 原始码 ──/70──► measuredRateDps
 | `GYRO_SAMPLE_PERIOD_MS` | 10 | 采样周期 |
 | `GYRO_CALIBRATION_SAMPLES` | 200 | 零偏校准样本数（2 s） |
 | `GYRO_LOWPASS_TAU_SECONDS` | 0.03183 | 一阶低通，约 5 Hz |
-| `GYRO_ZUPT_MAX_RATE_DPS` | 12.0 | 静止判据角速度门限 |
-| `GYRO_ZUPT_CONFIRM_SAMPLES` | 50 | 连续 50 拍（0.5 s）才确认静止 |
-| `GYRO_ZUPT_EXIT_CONFIRM_SAMPLES` | 2 | 出场确认拍数（滞回判据） |
+| `GYRO_ZUPT_MAX_RATE_DPS` | 12.0 | 静止判据角速度门限（入场与出场共用，死区不因抗尖峰变大） |
+| `GYRO_ZUPT_CONFIRM_SAMPLES` | 50 | 入场：连续 50 拍（0.5 s）满足判据才确认静止 |
+| `GYRO_ZUPT_JUDGE_MEDIAN3` | 1 | 入场判据吃 3 拍中值（抗单拍 SPI 位错） |
+| `GYRO_ZUPT_JUDGE_HYSTERESIS` | 1 | 1 = 启用判据滞回（入场中值 / 出场原值） |
+| `GYRO_ZUPT_EXIT_FAST_DPS` | 24.0 | 出场 tier-1：单拍原值超此值立刻解锁 |
+| `GYRO_ZUPT_EXIT_CONFIRM_SAMPLES` | 2 | 出场 tier-2：连续 2 拍超 12 °/s 解锁 |
 | `GYRO_BIAS_TRACK_GAIN` | 0.0025 | 零偏慢跟踪外层（τ≈4 s） |
 | `GYRO_BIAS_TRACK_AVG_GAIN` | 0.02 | 零偏慢跟踪内层平滑（τ≈0.5 s） |
 | `GYRO_ANGLE_SCALE_CALIBRATION` | 1.0 | 标度细调，按实测角度残差微调 |
+
+### 静止判据的滞回（ZUPT）
+
+入场和出场必须用不同的信号，否则总有一头吃亏：
+
+| 方案 | 抗单拍尖峰 | 退出延迟 | 结果 |
+|---|---|---|---|
+| 只用中值 | 是 | 晚 1 拍 | 200 °/s 快转启动丢 `0.01 s × 200 = 2°` |
+| 只用原值 | 否 | 0 | bit10 位错（14.6 °/s）打断 0.5 s 确认窗口 |
+| **滞回（当前）** | **是** | **0** | 两边的损失都消掉 |
+
+- **入场**：`|3 拍中值| <= 12 °/s` 连续 50 拍 → 锁定。
+- **出场 tier-1**：单拍 `|原值| > 24 °/s` → 立刻解锁（0 拍丢失）。
+  24 °/s 是给实测 bit10 位错 14.6 °/s 留的 1.6 倍余量。
+- **出场 tier-2**：连续 2 拍 `|原值| > 12 °/s` → 解锁（丢 1 拍即 10 ms，
+  在 12~24 °/s 区间最多 0.24°，可忽略）。
 
 调试统计开关 `GYRO_ZUPT_DEBUG_STATS_ENABLE` 默认 `1U`，发布前应改回 `0U`
 （关闭后相关全局量和统计代码不参与编译）。

@@ -131,10 +131,13 @@
  * ★ 物理含义没变：旧值 3.00 是按"驱动小 4 倍"的读数定的，换算成真实角速度
  *   就是 12 °/s。现在驱动已改成 70 LSB/(°/s)，所以这里同步 ×4。
  * ★ 12 °/s 是很大的死区：比 12 °/s 慢的转动会被判成静止、不计入角度。
- *   下一轮要把它降下来（滤波值入场 + 原始值出场的滞回方案），见 README。 */
-#define GYRO_ZUPT_MAX_STEP_DPS      24.00f  /* 相邻样本跳变上限（×4 换算自旧值 6.00）
- * ★ 注意：只要两拍都满足 |c| <= GYRO_ZUPT_MAX_RATE_DPS，则 |Δc| <= 2×12 = 24
- *   必然成立，所以这个判据在当前取值下永远不生效（数学冗余）。 */
+ *   滞回判据（见下面 GYRO_ZUPT_JUDGE_HYSTERESIS）把这个门限同时用于
+ *   入场和出场，所以死区不会因为抗尖峰而变大。 */
+#define GYRO_ZUPT_MAX_STEP_DPS      24.00f  /* 入场判据的相邻样本跳变上限
+ * ★ 入场用的是 3 拍中值，只要连续两拍中值都满足 |c| <= 12，则 |Δc| <= 24
+ *   必然成立，所以这个判据在当前取值下永远不生效（数学冗余）。
+ *   保留它只为 GYRO_ZUPT_JUDGE_MEDIAN3 = 0U 的 A/B 分支（那时判据是原值，
+ *   跳变判据才真正起作用）。 */
 #define GYRO_ZUPT_CONFIRM_SAMPLES   50U     /* 连续满足静止判据的样本数（10ms → 0.5s）*/
 /* 判定信号选择：0 = 直接用本拍补偿后角速度（原行为）
  *               1 = 用最近 3 拍的中值
@@ -143,6 +146,31 @@
  * 3 拍中值会把孤立尖峰完全吃掉（它前后两拍都快照原样输出），真实转动只多
  * 1 拍（10ms）延迟。想回到原行为便于 A/B 对比时，把它改成 0U 即可。 */
 #define GYRO_ZUPT_JUDGE_MEDIAN3     1U
+/* ---- ZUPT 判据滞回（GYRO_ZUPT_JUDGE_HYSTERESIS = 1U 时启用）---------------
+ * 入场（未锁定 → 锁定）：连续 GYRO_ZUPT_CONFIRM_SAMPLES 拍满足
+ *                         |judgeRateDps| <= GYRO_ZUPT_MAX_RATE_DPS
+ *   judgeRateDps 由上面的 GYRO_ZUPT_JUDGE_MEDIAN3 决定（默认 3 拍中值）。
+ * 出场（已锁定 → 未锁定）：两档判据，任一成立即解锁 ——
+ *   tier-1：本拍 |correctedRateDps| > GYRO_ZUPT_EXIT_FAST_DPS      → 立刻解锁
+ *   tier-2：连续 GYRO_ZUPT_EXIT_CONFIRM_SAMPLES 拍
+ *           |correctedRateDps| > GYRO_ZUPT_MAX_RATE_DPS            → 解锁
+ *
+ * ★ 为什么两侧必须用不同信号（这是本判据的核心）：
+ *   - 只用中值（MEDIAN3 = 1、无滞回）：抗尖峰，但"退出锁定"也晚 1 拍，
+ *     高速段 200 °/s × 10 ms = 2° 的角度会被当成静止丢掉。
+ *   - 只用原值（MEDIAN3 = 0、无滞回）：退出零延迟，但单拍 bit10 位错
+ *     （1024 码 = 14.6 °/s）会打断 0.5 s 确认窗口，静止时平均 50 s 掉一次锁。
+ *   - 滞回：入场抗尖峰（中值 + 50 拍连击），出场零延迟（原值 + 连击确认）。
+ *     孤立单拍尖峰最多让 exitCounter 变成 1，下一拍就复位；
+ *     真实转动连续超阈值，2 拍（10 ms）即解锁。
+ * ★ 两侧共用 GYRO_ZUPT_MAX_RATE_DPS，所以慢转死区**没有变大**。
+ * ★ tier-1 为什么取 24 °/s：实测唯一的单拍尖峰是 bit10 位错 = 14.6 °/s，
+ *   24 给它 1.6 倍余量；而 >24 °/s 的转动一定是真实运动，没必要再等一拍
+ *   （等一拍就是白丢 10 ms，高速下可达 2°）。
+ * ★ 置 0U 回到"单一判据 + 立即清零"的原行为，便于 A/B 对比。 */
+#define GYRO_ZUPT_JUDGE_HYSTERESIS      1U
+#define GYRO_ZUPT_EXIT_FAST_DPS         24.0f
+#define GYRO_ZUPT_EXIT_CONFIRM_SAMPLES  2U
 #define GYRO_BIAS_TRACK_GAIN        0.0025f /* 外层：静止时偏置跟踪步长（≈4s 收敛时间常数）*/
 /* 内层平均：先对"补偿后角速度"做一级 τ≈0.5s 的滑动平均，再喂给外层积分器。
  * ★ 为什么必须有它：单级积分器的零偏抖动 σ ≈ σ_noise × √(g/2)。实测静止噪声
@@ -172,6 +200,8 @@
  *   gyroDbgHoldDropCount    静止计时被打断的累计次数（真正的"掉出锁定"）
  *   gyroDbgRateDropCount    其中因角速度超阈值掉的次数
  *   gyroDbgStepDropCount    其中因相邻跳变超阈值掉的次数
+ *   gyroDbgFastExitCount    滞回判据 tier-1 解锁次数（> GYRO_ZUPT_EXIT_FAST_DPS）
+ *   gyroDbgSlowExitCount    滞回判据 tier-2 解锁次数（连击确认）
  *   gyroDbgRateFailCount    最近 1s 内 |值| > GYRO_ZUPT_MAX_RATE_DPS 的样本数
  *   gyroDbgStepFailCount    最近 1s 内跳变 > GYRO_ZUPT_MAX_STEP_DPS 的样本数
  *   gyroDbgZuptLostDeg      ZUPT 冻结期间丢掉的角度（°，手动清零）
@@ -386,6 +416,12 @@ volatile uint32_t gyroDbgHoldRunMax = 0U;
 volatile uint32_t gyroDbgHoldDropCount = 0U;
 volatile uint32_t gyroDbgRateDropCount = 0U;
 volatile uint32_t gyroDbgStepDropCount = 0U;
+/* 滞回判据的两档出场计数（只在 GYRO_ZUPT_JUDGE_HYSTERESIS = 1 时有意义）：
+ *   gyroDbgFastExitCount  tier-1 单拍解锁次数（> 24 °/s，真实高速转动）
+ *   gyroDbgSlowExitCount  tier-2 连击解锁次数（12~24 °/s，慢转或持续噪声）
+ * 静止台上跑一分钟，这两个数都应该是 0；只有真正转动时才会增长。 */
+volatile uint32_t gyroDbgFastExitCount = 0U;
+volatile uint32_t gyroDbgSlowExitCount = 0U;
 /* 判定信号本身（开了中值就是中值，没开就是本拍原值）的统计：
  * 调 GYRO_ZUPT_MAX_RATE_DPS 要看这一组，而不是看 raw 峰值。 */
 volatile float    gyroDbgJudgePeakDps = 0.0f;
@@ -397,7 +433,7 @@ volatile uint32_t gyroDbgJudgeFailCount = 0U;
  * 判读：静止时它只有"残余零偏×时间"，很小；慢速转动（< ZUPT 阈值）时它就是
  * 被吃掉的那部分角度。整圈 360° 少读 1.3°，这里就应该读到 ≈ -1.3。 */
 volatile float    gyroDbgZuptLostDeg = 0.0f;
-/* 累计分布：|补偿后角速度| 超过 0.5/1/2/3/5/8 dps 的样本数（手动写 0 清零） */
+/* 累计分布：|补偿后角速度| 超过 2/4/8/12/20/32 °/s 的样本数（手动写 0 清零） */
 #define GYRO_DBG_HIST_BINS 6U
 volatile uint32_t gyroDbgHistOver[GYRO_DBG_HIST_BINS] = {0U, 0U, 0U, 0U, 0U, 0U};
 volatile uint32_t gyroDbgHistSamples = 0U;
@@ -829,6 +865,9 @@ static void task_gyro(void const *argument)
 	float judgeRateDps = 0.0f;             /* 本拍实际参与判据的信号（可能是中值）    */
 	float previousJudgeRateDps = 0.0f;     /* 上一拍参与判据的信号，用于跳变判据      */
 	uint8_t havePreviousJudge = 0U;        /* 是否已有上一拍参与判据的信号            */
+#if (GYRO_ZUPT_JUDGE_HYSTERESIS != 0U)
+	uint8_t zuptExitCounter = 0U;          /* 锁定时连续超阈值的拍数（出场确认）      */
+#endif
 #if (GYRO_ZUPT_JUDGE_MEDIAN3 != 0U)
 	float judgeSamples[3] = {0.0f, 0.0f, 0.0f};
 	uint8_t judgeIndex = 0U;
@@ -884,6 +923,9 @@ static void task_gyro(void const *argument)
 			zuptCounter = GYRO_ZUPT_CONFIRM_SAMPLES;
 			zuptActive = 1U;
 			havePreviousJudge = 0U;
+#if (GYRO_ZUPT_JUDGE_HYSTERESIS != 0U)
+			zuptExitCounter = 0U;
+#endif
 #if (GYRO_ZUPT_JUDGE_MEDIAN3 != 0U)
 			judgeFilled = 0U;
 #endif
@@ -1026,6 +1068,9 @@ static void task_gyro(void const *argument)
 						zuptCounter = GYRO_ZUPT_CONFIRM_SAMPLES;
 						zuptActive = 1U;
 						havePreviousJudge = 0U;
+#if (GYRO_ZUPT_JUDGE_HYSTERESIS != 0U)
+						zuptExitCounter = 0U;
+#endif
 #if (GYRO_ZUPT_JUDGE_MEDIAN3 != 0U)
 						judgeFilled = 0U;
 #endif
@@ -1150,6 +1195,84 @@ static void task_gyro(void const *argument)
 #else
 					judgeRateDps = correctedRateDps;
 #endif
+#if (GYRO_ZUPT_JUDGE_HYSTERESIS != 0U)
+					if (zuptActive != 0U)
+					{
+						/* --- 已锁定：走"出场"判据（本拍原值，不用中值）-------
+						 * 真实转动零延迟退出；孤立单拍尖峰只能让
+						 * zuptExitCounter 到 1，下一拍就复位。
+						 * zuptCounter 在锁定期间保持满值，所以这里不清它。 */
+						if (GyroAbsF(correctedRateDps) > GYRO_ZUPT_EXIT_FAST_DPS)
+						{
+							/* tier-1：明显是运动，立刻解锁，一拍角度都不丢 */
+#if (GYRO_ZUPT_DEBUG_ACTIVE != 0U)
+							gyroDbgHoldDropCount++;
+							gyroDbgRateDropCount++;
+							gyroDbgFastExitCount++;
+#endif
+							zuptCounter = 0U;
+							zuptExitCounter = 0U;
+						}
+						else if (GyroAbsF(correctedRateDps) > GYRO_ZUPT_MAX_RATE_DPS)
+						{
+							/* tier-2：12~24 °/s，可能是噪声也可能是慢转，
+							 * 要求连续 GYRO_ZUPT_EXIT_CONFIRM_SAMPLES 拍 */
+							if (zuptExitCounter < GYRO_ZUPT_EXIT_CONFIRM_SAMPLES)
+							{
+								zuptExitCounter++;
+							}
+							if (zuptExitCounter >= GYRO_ZUPT_EXIT_CONFIRM_SAMPLES)
+							{
+#if (GYRO_ZUPT_DEBUG_ACTIVE != 0U)
+								gyroDbgHoldDropCount++;
+								gyroDbgRateDropCount++;
+								gyroDbgSlowExitCount++;
+#endif
+								zuptCounter = 0U;
+								zuptExitCounter = 0U;
+							}
+						}
+						else
+						{
+							zuptExitCounter = 0U;
+						}
+					}
+					else
+					{
+						/* --- 未锁定：走"入场"判据（判据信号 + 连击计时）----- */
+						if ((GyroAbsF(judgeRateDps) <= GYRO_ZUPT_MAX_RATE_DPS) &&
+							((havePreviousJudge == 0U) ||
+							 (GyroAbsF(judgeRateDps - previousJudgeRateDps) <=
+							  GYRO_ZUPT_MAX_STEP_DPS)))
+						{
+							if (zuptCounter < GYRO_ZUPT_CONFIRM_SAMPLES)
+							{
+								zuptCounter++;
+							}
+						}
+						else
+						{
+#if (GYRO_ZUPT_DEBUG_ACTIVE != 0U)
+							/* 只在"本来在计时"时记一次：一直失败时 counter 已经是 0，
+							 * 不会每 10ms 累加一次，所以这个数就是真实的打断次数。 */
+							if (zuptCounter > 0U)
+							{
+								gyroDbgHoldDropCount++;
+								if (GyroAbsF(judgeRateDps) > GYRO_ZUPT_MAX_RATE_DPS)
+								{
+									gyroDbgRateDropCount++;
+								}
+								else
+								{
+									gyroDbgStepDropCount++;
+								}
+							}
+#endif
+							zuptCounter = 0U;
+						}
+						zuptExitCounter = 0U;
+					}
+#else
 					if ((GyroAbsF(judgeRateDps) <= GYRO_ZUPT_MAX_RATE_DPS) &&
 						((havePreviousJudge == 0U) ||
 						 (GyroAbsF(judgeRateDps - previousJudgeRateDps) <=
@@ -1180,6 +1303,7 @@ static void task_gyro(void const *argument)
 #endif
 						zuptCounter = 0U;
 					}
+#endif
 					previousJudgeRateDps = judgeRateDps;
 					havePreviousJudge = 1U;
 #if (GYRO_ZUPT_DEBUG_ACTIVE != 0U)
@@ -1395,6 +1519,9 @@ static void task_gyro(void const *argument)
 			zuptActive = 0U;
 			havePreviousJudge = 0U;
 			biasTrackPrimed = 0U;
+#if (GYRO_ZUPT_JUDGE_HYSTERESIS != 0U)
+			zuptExitCounter = 0U;
+#endif
 #if (GYRO_ZUPT_JUDGE_MEDIAN3 != 0U)
 			judgeFilled = 0U;
 #endif
