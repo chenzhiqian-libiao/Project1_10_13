@@ -28,6 +28,11 @@ TraceReports/
 *.log
 *.tmp
 
+# 本地临时快照（每次调参前手动另存的 .bak_时间戳_说明）
+*.bak
+*.bak_*
+_tc_*
+
 # Local credentials
 .env
 .env.*
