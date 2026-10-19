@@ -171,6 +171,34 @@
 #define GYRO_ZUPT_JUDGE_HYSTERESIS      1U
 #define GYRO_ZUPT_EXIT_FAST_DPS         24.0f
 #define GYRO_ZUPT_EXIT_CONFIRM_SAMPLES  2U
+/* ---- 静止锁定结束时的"起步坡道补偿" --------------------------------------
+ * ★ 它解决的是"每次起步都要丢掉一段坡道"这个问题。
+ *   锁定期间角度被冻结，可平台并不是瞬间停下的：从静止起转时，角速度从 0
+ *   一路升到判据门限之前，全部落在锁定区间里、被整段丢掉。设加速度为 a，
+ *     丢失角度 ≈ 门限² / (2a)。
+ *   上位机默认参数（100 mm/s、500 mm/s²、D = 100 mm）换算成角运动是
+ *     速度 ≈ 114.6 °/s，加速度 ≈ 573 °/s²；
+ *   tier-1 在 24 °/s 解锁 → 丢 24²/(2×573) ≈ 0.50°，
+ *   tier-2 在 ~12 °/s 解锁 → 丢 12²/(2×573) ≈ 0.13°。
+ * ★ 注意方向：这个损失只出现在每段运动的**起点**（终点减速时 ZUPT 要连续
+ *   50 拍不超阈值才锁定，减速坡道早就积进去了），所以它是**有方向**的。
+ *   往返一次时，去程与回程各丢一次、方向相反，两者会部分抵消；于是最终
+ *   误差取决于"远端有没有重新锁定"，而重锁与否只看远端停顿是否超过 0.5s。
+ *   这就是"停久一点 / 停短一点结果不一样、178 和 179 差出 0.6°"的来源。
+ *
+ * 补偿办法：锁定期间把"本来该积进去"的增量（与积分分支用逐字相同的梯形公式）
+ * 存进一个 0.25s 的环形缓冲；解锁的那一刻，把这 0.25s 的和补回角度。
+ *   - 为什么是 0.25s：默认加速度下 24 °/s 的坡道只有 0.042s，即使加速度
+ *     降到 100 °/s² 也只要 0.24s，0.25s 足够全包住；
+ *   - 为什么不是全部锁定区间：更早的部分是真正的静止，补回去等于把零偏当角度；
+ *   - 为什么用同一公式：补回的量就是"当初不冻结时会积进去的量"，逐位可比，
+ *     所以补完等于"这段时间从未冻结"，不会引入新的标度误差；
+ *   - 门限 GYRO_ZUPT_RAMP_RECOVER_MIN_DEG 挡误解锁：静止时 0.25s 的冻结积分
+ *     只有 残余零偏×0.25s ≈ 0.002°，远低于 0.02°，不会污染 0.00000°。
+ *   - 效果：起步不再丢坡道，往返误差与"远端停多久"解耦。 */
+#define GYRO_ZUPT_RAMP_RECOVER_ENABLE   1U
+#define GYRO_ZUPT_RAMP_RECOVER_SAMPLES  25U     /* 10 ms × 25 = 0.25s 环形缓冲    */
+#define GYRO_ZUPT_RAMP_RECOVER_MIN_DEG  0.02f   /* 小于此值判为噪声，不补         */
 #define GYRO_BIAS_TRACK_GAIN        0.0025f /* 外层：静止时偏置跟踪步长（≈4s 收敛时间常数）*/
 /* 内层平均：先对"补偿后角速度"做一级 τ≈0.5s 的滑动平均，再喂给外层积分器。
  * ★ 为什么必须有它：单级积分器的零偏抖动 σ ≈ σ_noise × √(g/2)。实测静止噪声
@@ -202,6 +230,8 @@
  *   gyroDbgStepDropCount    其中因相邻跳变超阈值掉的次数
  *   gyroDbgFastExitCount    滞回判据 tier-1 解锁次数（> GYRO_ZUPT_EXIT_FAST_DPS）
  *   gyroDbgSlowExitCount    滞回判据 tier-2 解锁次数（连击确认）
+ *   gyroDbgRampRecoverCount 起步坡道补偿执行次数
+ *   gyroDbgRampRecoverDegSum 起步坡道累计补回的角度（°）
  *   gyroDbgRateFailCount    最近 1s 内 |值| > GYRO_ZUPT_MAX_RATE_DPS 的样本数
  *   gyroDbgStepFailCount    最近 1s 内跳变 > GYRO_ZUPT_MAX_STEP_DPS 的样本数
  *   gyroDbgZuptLostDeg      ZUPT 冻结期间丢掉的角度（°，手动清零）
@@ -422,6 +452,13 @@ volatile uint32_t gyroDbgStepDropCount = 0U;
  * 静止台上跑一分钟，这两个数都应该是 0；只有真正转动时才会增长。 */
 volatile uint32_t gyroDbgFastExitCount = 0U;
 volatile uint32_t gyroDbgSlowExitCount = 0U;
+/* 起步坡道补偿的生效情况：
+ *   gyroDbgRampRecoverCount   补偿执行次数（每次解锁最多 1 次）
+ *   gyroDbgRampRecoverDegSum  累计补回的角度（°，手动写 0 清零）
+ * 一轮 90° 往返正常应看到 Count 增加 1~2、DegSum 增加 0.3~2.6（取决于加速度）。
+ * 若 Count 从不增长，说明解锁时坡道已整段落在 0.25s 缓冲之外。 */
+volatile uint32_t gyroDbgRampRecoverCount = 0U;
+volatile float    gyroDbgRampRecoverDegSum = 0.0f;
 /* 判定信号本身（开了中值就是中值，没开就是本拍原值）的统计：
  * 调 GYRO_ZUPT_MAX_RATE_DPS 要看这一组，而不是看 raw 峰值。 */
 volatile float    gyroDbgJudgePeakDps = 0.0f;
@@ -868,6 +905,15 @@ static void task_gyro(void const *argument)
 #if (GYRO_ZUPT_JUDGE_HYSTERESIS != 0U)
 	uint8_t zuptExitCounter = 0U;          /* 锁定时连续超阈值的拍数（出场确认）      */
 #endif
+#if (GYRO_ZUPT_RAMP_RECOVER_ENABLE != 0U)
+	uint8_t zuptWasActive = 0U;            /* 上一拍的锁定状态，用来抓 1→0 的跳变      */
+	/* 起步坡道补偿缓冲：锁定期间"本来会积进去"的角度增量，解锁时整体补回。
+	 * 用 static 放在 .bss 而不是任务栈上：这是 100 字节，任务栈只有 1KB，
+	 * 而它只在 task_gyro 里用（单任务访问，不需要额外保护）。 */
+	static float rampRecoverBuf[GYRO_ZUPT_RAMP_RECOVER_SAMPLES];
+	uint8_t rampRecoverIndex = 0U;
+	uint8_t rampRecoverCount = 0U;
+#endif
 #if (GYRO_ZUPT_JUDGE_MEDIAN3 != 0U)
 	float judgeSamples[3] = {0.0f, 0.0f, 0.0f};
 	uint8_t judgeIndex = 0U;
@@ -925,6 +971,11 @@ static void task_gyro(void const *argument)
 			havePreviousJudge = 0U;
 #if (GYRO_ZUPT_JUDGE_HYSTERESIS != 0U)
 			zuptExitCounter = 0U;
+#endif
+#if (GYRO_ZUPT_RAMP_RECOVER_ENABLE != 0U)
+			/* 刚归零/刚校准，缓冲里的旧增量没有意义，必须丢弃 */
+			rampRecoverCount = 0U;
+			rampRecoverIndex = 0U;
 #endif
 #if (GYRO_ZUPT_JUDGE_MEDIAN3 != 0U)
 			judgeFilled = 0U;
@@ -1071,6 +1122,10 @@ static void task_gyro(void const *argument)
 #if (GYRO_ZUPT_JUDGE_HYSTERESIS != 0U)
 						zuptExitCounter = 0U;
 #endif
+#if (GYRO_ZUPT_RAMP_RECOVER_ENABLE != 0U)
+						rampRecoverCount = 0U;
+						rampRecoverIndex = 0U;
+#endif
 #if (GYRO_ZUPT_JUDGE_MEDIAN3 != 0U)
 						judgeFilled = 0U;
 #endif
@@ -1173,6 +1228,9 @@ static void task_gyro(void const *argument)
 				 * ★ GYRO_ZUPT_JUDGE_MEDIAN3 = 1 时，判据吃的是 3 拍中值：
 				 *   孤立单拍尖峰（SPI 损坏 / EMI）不再能把 0.5s 计数清零。 */
 				{
+#if (GYRO_ZUPT_RAMP_RECOVER_ENABLE != 0U)
+					zuptWasActive = zuptActive;
+#endif
 #if (GYRO_ZUPT_JUDGE_MEDIAN3 != 0U)
 					judgeSamples[judgeIndex] = correctedRateDps;
 					judgeIndex = (uint8_t)((judgeIndex + 1U) % 3U);
@@ -1323,6 +1381,35 @@ static void task_gyro(void const *argument)
 #endif
 				}
 				zuptActive = (zuptCounter >= GYRO_ZUPT_CONFIRM_SAMPLES) ? 1U : 0U;
+#if (GYRO_ZUPT_RAMP_RECOVER_ENABLE != 0U)
+				/* --- 起步坡道补偿：锁定刚刚结束，把冻结期间最后 0.25s 的角度补回 ---
+				 * 冻结期间角度不动，但平台是从静止加速上来的。解锁时角速度已经
+				 * 越过判据门限（tier-1 是 24 °/s），0→门限 这段坡道整段被丢掉了。
+				 * 这里把"不冻结时本来会积进去"的增量原样加回去，等价于这段时间
+				 * 从未冻结，所以不会引入新的标度误差。
+				 * ★ 只在 1→0 的跳变上补一次；静止时这点增量只有零偏×0.25s≈0.002°，
+				 *   被 MIN_DEG 门限挡掉，不会污染 0.00000° 的静止显示。 */
+				if ((zuptWasActive != 0U) && (zuptActive == 0U))
+				{
+					float recoverDeg = 0.0f;
+					uint8_t recoverIndex;
+
+					for (recoverIndex = 0U; recoverIndex < rampRecoverCount; recoverIndex++)
+					{
+						recoverDeg += rampRecoverBuf[recoverIndex];
+					}
+					if (GyroAbsF(recoverDeg) >= GYRO_ZUPT_RAMP_RECOVER_MIN_DEG)
+					{
+						accumulatedAngleDeg += recoverDeg;
+#if (GYRO_ZUPT_DEBUG_ACTIVE != 0U)
+						gyroDbgRampRecoverCount++;
+						gyroDbgRampRecoverDegSum += recoverDeg;
+#endif
+					}
+					rampRecoverCount = 0U;
+					rampRecoverIndex = 0U;
+				}
+#endif
 #if (GYRO_ZUPT_DEBUG_ACTIVE != 0U)
 				if (zuptCounter > gyroDbgHoldRunMax)
 				{
@@ -1405,6 +1492,19 @@ static void task_gyro(void const *argument)
 						 * 不会继续被累积成角度漂移。滤波状态照常更新，所以
 						 * 一旦真的开始转动，角度能立刻平滑接上，不会跳变。 */
 						zuptFrozenSamples++;
+#if (GYRO_ZUPT_RAMP_RECOVER_ENABLE != 0U)
+						/* 把"本来该积进去、被 ZUPT 挡掉"的增量存进环形缓冲，
+						 * 解锁时整体补回（公式与下面的积分分支逐字相同）。 */
+						rampRecoverBuf[rampRecoverIndex] =
+							((previousFilteredRateDps + filteredRateDps) * 0.5f) *
+							((float)elapsedMs / 1000.0f) * GYRO_ANGLE_SCALE_CALIBRATION;
+						rampRecoverIndex = (uint8_t)
+							((rampRecoverIndex + 1U) % GYRO_ZUPT_RAMP_RECOVER_SAMPLES);
+						if (rampRecoverCount < GYRO_ZUPT_RAMP_RECOVER_SAMPLES)
+						{
+							rampRecoverCount++;
+						}
+#endif
 #if (GYRO_ZUPT_DEBUG_ACTIVE != 0U)
 						/* 顺手把"本来该积进去、被 ZUPT 挡掉"的角度累下来。
 						 * 公式和下面的积分分支完全一致，所以它与真实积分严格可比：
@@ -1521,6 +1621,11 @@ static void task_gyro(void const *argument)
 			biasTrackPrimed = 0U;
 #if (GYRO_ZUPT_JUDGE_HYSTERESIS != 0U)
 			zuptExitCounter = 0U;
+#endif
+#if (GYRO_ZUPT_RAMP_RECOVER_ENABLE != 0U)
+			/* 采样断了，缓冲里的增量跨越了无效区间，必须丢弃 */
+			rampRecoverCount = 0U;
+			rampRecoverIndex = 0U;
 #endif
 #if (GYRO_ZUPT_JUDGE_MEDIAN3 != 0U)
 			judgeFilled = 0U;
