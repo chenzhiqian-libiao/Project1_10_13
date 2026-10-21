@@ -16,6 +16,8 @@ static uint8_t canBusOffActive;
 /* ---- 调试诊断变量 ---- */
 volatile uint32_t canTxOkCount = 0U;
 volatile uint32_t canTxErrCount = 0U;
+volatile uint32_t canTxMailboxWaitCount = 0U;
+volatile uint32_t canTxMailboxTimeoutCount = 0U;
 volatile uint32_t canRxOkCount = 0U;
 volatile uint32_t canRxErrCount = 0U;
 volatile uint32_t canEsr = 0U;
@@ -116,12 +118,19 @@ HAL_StatusTypeDef CAN_Init(void)
 /* 发送一帧经典 CAN 标准数据帧（非 CAN FD、非扩展帧） */
 HAL_StatusTypeDef CAN_SendFrame(uint16_t std_id, const uint8_t *data, uint8_t len)
 {
+	return CAN_SendFrameWait(std_id, data, len, 0U);
+}
+
+HAL_StatusTypeDef CAN_SendFrameWait(uint16_t std_id, const uint8_t *data, uint8_t len,
+								   uint32_t timeoutMs)
+{
 	CAN_TxHeaderTypeDef txHeader;
 	/* HAL_CAN_AddTxMessage() 固定读取 8 个字节，缓冲区必须是 8 字节 */
 	uint8_t txData[8] = {0};
 	uint32_t txMailbox = 0U;
 	HAL_StatusTypeDef status;
 	uint8_t i;
+	uint32_t waitStart;
 
 	if ((canInitialized == 0U) || (std_id > 0x7FFU) || (data == NULL) ||
 		(len == 0U) || (len > 8U))
@@ -156,6 +165,23 @@ HAL_StatusTypeDef CAN_SendFrame(uint16_t std_id, const uint8_t *data, uint8_t le
 	txHeader.RTR = CAN_RTR_DATA;
 	txHeader.DLC = (uint32_t)len;
 	txHeader.TransmitGlobalTime = DISABLE;
+
+	if ((timeoutMs != 0U) && (HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) == 0U))
+	{
+		canTxMailboxWaitCount++;
+		waitStart = HAL_GetTick();
+		while (HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) == 0U)
+		{
+			if ((uint32_t)(HAL_GetTick() - waitStart) >= timeoutMs)
+			{
+				canEsr = hcan1.Instance->ESR;
+				canFreeMailboxes = 0U;
+				canTxMailboxTimeoutCount++;
+				canTxErrCount++;
+				return HAL_TIMEOUT;
+			}
+		}
+	}
 
 	status = HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, &txMailbox);
 

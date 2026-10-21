@@ -100,10 +100,21 @@
  *   1 Mbps 下每 10 ms 两帧（0x321 + 0x323）约 26 kbit/s，占用可以忽略。
  *   要回到旧节奏只改这一行即可；采样与积分周期（GYRO_SAMPLE_PERIOD_MS）不受影响。 */
 #define CAN_TX_PERIOD_MS            10U     /* 课题六测量帧发送周期                   */
+#define CAN_TX_MAILBOX_TIMEOUT_MS   2U      /* 4 帧共享 3 邮箱，等待有界且可被采样任务抢占 */
 #define GYRO_SAMPLE_PERIOD_MS       10U     /* 角速度采样周期                         */
+/* 单拍读取失败后，允许下一个有效样本"跨接"的最大空洞长度（ms）。
+ * 只要空洞不超过这个值，就按真实 elapsedMs 把中间那段时间一起积起来；
+ * 超过则判定采样已不可信，积分/ZUPT/滤波状态整体作废重来。
+ * 取值要远大于正常抖动（正常 10ms，掉一拍 20ms），又远小于"丢了一秒角度"的量级。 */
+#define GYRO_MAX_BRIDGE_MS          50U
 #define GYRO_TEMP_PERIOD_MS         1000U   /* 温度读取降频，避免干扰角速度采样       */
 #define GYRO_STABILIZE_MS           1000U   /* 上电稳定等待时间                       */
-#define GYRO_CALIBRATION_SAMPLES    200U    /* 软件零偏校准有效样本数                 */
+#define GYRO_CALIBRATION_SAMPLES    6000U   /* 60 s 估计；后续验证样本不参与零偏拟合 */
+#define GYRO_CALIBRATION_VALIDATION_SAMPLES 2000U
+#define GYRO_CALIBRATION_VALIDATION_BLOCK_SAMPLES 500U
+/* 每个独立 5 s 窗口均值限值：若持续 200 s，偏差预算为 0.3 度。
+ * 这是校准质量门限，不是未来温漂或机械静止的保证。 */
+#define GYRO_CALIBRATION_MAX_RESIDUAL_DPS 0.0015f
 #define GYRO_CALIBRATION_MAX_RANGE_DPS 8.0f /* 校准样本最大峰峰波动，超出则判失败（×4 换算自旧值 2.0，见 XV7001BB_SCALE_16BIT）*/
 #define GYRO_CALIBRATION_MAX_BIAS_DPS  40.0f/* 校准均值过大时判为不静止/异常（×4 换算自旧值 10.0）*/
 /* 校准判失败后的自动重试间隔。之前失败即停在 state 3 不再重试，桌面轻微震动就会
@@ -111,24 +122,28 @@
 #define GYRO_CALIBRATION_RETRY_DELAY_MS 2000U
 #define GYRO_RX_MAX_FRAMES_PER_POLL 4U     /* 每轮最多排空的 CAN 帧数，避免饿死采样   */
 #define GYRO_LOWPASS_TAU_SECONDS    0.03183099f /* 一阶低通约 5Hz 时间常数            */
-#define GYRO_ANGLE_SCALE_CALIBRATION 1.0063f /* 标度细调：标称 1.0，按实测角度残差标定（见下方说明）
- * ★ 这里原来是 4.0f（"实测 90° 显示 22.5°"的粗校正）。那个 4 倍来自驱动把
- *   70 LSB/(度每秒) 当成了 280，已在 xv7001bb.h 修好，所以 4 倍已撤销；
- *   若再填 4.0f 角度会被放大 4 倍。
- * ★ 取值依据（2026-10-20，两个 CSV 文件共 28 段 180° 行程，用 motor_angle_deg
- *   列作无噪真值）。模型 M = s·G + c，最小化 Σ(sG+c−M)²：
- *       s = 1.00633 ± 0.00087   (7.2σ 显著)   c = −0.042° ≈ 0
- *   即陀螺恒定读小 0.63%，是纯标度误差：正转读小、反转也读小，28 段符号无一例外。
- *   效果：180° 行程的系统性少算 1.15° → 去程残余 −0.003°、回程 +0.003°。
- * ★ 标定数据只能用"干净"的行程。同一文件里 6 段连发的 90° 行程（间隙 0.33s，
- *   小于 0.5s 确认窗口，ZUPT 全程未重锁）多背了约 0.4° 的自由积分零偏，
- *   其 G/M = 0.9825 明显低于 180° 段的 0.9937；混进去会把标度估成 1.0069。
- *   以后重标定请确保每段运动前留 ≥2s 静止。
- * ★ 重要：这个系数修的是"单程绝对角度偏小"，它不会改善 180° 往返残差。
- *   无论是标度误差还是每次运动的固定损失，在去程/回程里都同号出现，
- *   相减时正好抵消；往返残差(σ≈1.4°)来自残余零偏(σ≈0.39 度每秒)，
- *   它在往返里同向相加，改这个常数动不了它。
- * ★ 更换器件或改量程档位后必须重新标定：按上述方法取干净的 180° 行程重拟合。 */
+/* 中值不保持积分面积；默认仅校准和静止判定用中值，积分走线性低通。
+ * 置 1 可回到旧积分链做 A/B。线性链不剔除量程内尖峰，仍需检查原始日志。 */
+#ifndef GYRO_INTEGRATION_MEDIAN3_ENABLE
+#define GYRO_INTEGRATION_MEDIAN3_ENABLE 0U
+#endif
+#if (GYRO_INTEGRATION_MEDIAN3_ENABLE > 1U)
+#error "GYRO_INTEGRATION_MEDIAN3_ENABLE must be 0 or 1"
+#endif
+/* 往复测量基线：保留器件实测 /70，不用来源未确认的电机反馈拟合标度。 */
+#define GYRO_ANGLE_SCALE_CALIBRATION 1.0f
+/* 0：校准后固定零偏，整批往复（包括起步与中间停靠）不自动追踪。
+ * 1：旧跟踪算法，仅供 A/B；它会把未解锁起步段的真实速度吸收到零偏。
+ * 温漂需要在批次之间、确认机械静止后显式重新校准，不自动清零。 */
+#define GYRO_BIAS_TRACK_ENABLE       0U
+/* 连续测量不根据静止判据丢弃角度，允许显示真实静止漂移。
+ * 置 1 恢复旧冻结/25 拍回补；静止判定本身仍用于校准保护和状态上报。 */
+#ifndef GYRO_ZUPT_FREEZE_ENABLE
+#define GYRO_ZUPT_FREEZE_ENABLE      0U
+#endif
+#if (GYRO_ZUPT_FREEZE_ENABLE > 1U)
+#error "GYRO_ZUPT_FREEZE_ENABLE must be 0 or 1"
+#endif
 
 /* ---- 角度零漂抑制（课题六增强，总开关见下方 GYRO_DRIFT_SUPPRESS_ENABLE）----
  * 陀螺仪只输出角速度，残余零偏哪怕只有 1 个 LSB（1/70 ≈ 0.0143 °/s），
@@ -145,14 +160,19 @@
  *   若发现慢速转动被吃掉，把 GYRO_DRIFT_SUPPRESS_ENABLE 置 0 即可整体关闭，
  *   角度退回到"纯积分"行为。 */
 #define GYRO_DRIFT_SUPPRESS_ENABLE  1U      /* 1 = 启用 ZUPT + 偏置慢跟踪          */
-#define GYRO_ZUPT_MAX_RATE_DPS      12.00f  /* 判定静止的最大角速度幅值（°/s）
- * ★ 物理含义没变：旧值 3.00 是按"驱动小 4 倍"的读数定的，换算成真实角速度
- *   就是 12 °/s。现在驱动已改成 70 LSB/(°/s)，所以这里同步 ×4。
- * ★ 12 °/s 是很大的死区：比 12 °/s 慢的转动会被判成静止、不计入角度。
+#define GYRO_ZUPT_MAX_RATE_DPS      40.00f  /* 判定静止的最大角速度幅值（°/s）
+ * ★ 沿革：3.00（驱动小 4 倍的旧读数）→ 12（换算到真实 °/s）→ 20 → 40（2026-10-21）。
+ * ★ 40 °/s 是极大的死区：比 40 °/s 慢的转动会被判成静止、不计入角度。
+ *   按台架换算（100 mm/s ↔ 114.6 °/s）相当于 35 mm/s 以下的匀速运动。
  *   滞回判据（见下面 GYRO_ZUPT_JUDGE_HYSTERESIS）把这个门限同时用于
- *   入场和出场，所以死区不会因为抗尖峰而变大。 */
-#define GYRO_ZUPT_MAX_STEP_DPS      24.00f  /* 入场判据的相邻样本跳变上限
- * ★ 入场用的是 3 拍中值，只要连续两拍中值都满足 |c| <= 12，则 |Δc| <= 24
+ *   入场和出场，所以死区不会因为抗尖峰而变大。
+ * ★ 抬高门限的代价靠"起步坡道补偿"兜住：解锁时把冻结区间最后 0.25s
+ *   的增量补回，40 °/s 在 573 °/s² 下坡道只有 0.07s，完全在缓冲内。
+ * ★ 抬门限只能治标：真正的病根是 10ms 原值上出现 ~40 °/s 的单拍尖峰
+ *   （2865 码量级，不是真实角振动）。门限必须明显高于该尖峰才能稳住锁，
+ *   否则每次尖峰都会打断 0.5s 确认窗口。 */
+#define GYRO_ZUPT_MAX_STEP_DPS      80.00f  /* 入场判据的相邻样本跳变上限
+ * ★ 入场用的是 3 拍中值，只要连续两拍中值都满足 |c| <= 40，则 |Δc| <= 80
  *   必然成立，所以这个判据在当前取值下永远不生效（数学冗余）。
  *   保留它只为 GYRO_ZUPT_JUDGE_MEDIAN3 = 0U 的 A/B 分支（那时判据是原值，
  *   跳变判据才真正起作用）。 */
@@ -182,12 +202,13 @@
  *     孤立单拍尖峰最多让 exitCounter 变成 1，下一拍就复位；
  *     真实转动连续超阈值，2 拍（10 ms）即解锁。
  * ★ 两侧共用 GYRO_ZUPT_MAX_RATE_DPS，所以慢转死区**没有变大**。
- * ★ tier-1 为什么取 24 °/s：实测唯一的单拍尖峰是 bit10 位错 = 14.6 °/s，
- *   24 给它 1.6 倍余量；而 >24 °/s 的转动一定是真实运动，没必要再等一拍
- *   （等一拍就是白丢 10 ms，高速下可达 2°）。
+ * ★ tier-1 为什么取 80 °/s：实测单拍尖峰量级已到 ~41 °/s
+ *   （gyroDbgJudgePeakHoldDps 实测 40.93），tier-1 必须明显高于入场门限，
+ *   否则 40~80 这一档全被 tier-2 的两拍确认吃掉；>80 °/s 的转动一定是
+ *   真实运动，没必要再等一拍（等一拍就是白丢 10 ms，高速下可达 2°）。
  * ★ 置 0U 回到"单一判据 + 立即清零"的原行为，便于 A/B 对比。 */
 #define GYRO_ZUPT_JUDGE_HYSTERESIS      1U
-#define GYRO_ZUPT_EXIT_FAST_DPS         24.0f
+#define GYRO_ZUPT_EXIT_FAST_DPS         80.0f
 #define GYRO_ZUPT_EXIT_CONFIRM_SAMPLES  2U
 /* ---- 静止锁定结束时的"起步坡道补偿" --------------------------------------
  * ★ 它解决的是"每次起步都要丢掉一段坡道"这个问题。
@@ -196,8 +217,9 @@
  *     丢失角度 ≈ 门限² / (2a)。
  *   上位机默认参数（100 mm/s、500 mm/s²、D = 100 mm）换算成角运动是
  *     速度 ≈ 114.6 °/s，加速度 ≈ 573 °/s²；
- *   tier-1 在 24 °/s 解锁 → 丢 24²/(2×573) ≈ 0.50°，
- *   tier-2 在 ~12 °/s 解锁 → 丢 12²/(2×573) ≈ 0.13°。
+ *   tier-1 在 80 °/s 解锁 → 丢 80²/(2×573) ≈ 5.58°，
+ *   tier-2 在 ~40 °/s 解锁 → 丢 40²/(2×573) ≈ 1.40°。
+ *   ★ 这两个数都是"没有坡道补偿时"的损失；补偿能全部收回（见下）。
  * ★ 注意方向：这个损失只出现在每段运动的**起点**（终点减速时 ZUPT 要连续
  *   50 拍不超阈值才锁定，减速坡道早就积进去了），所以它是**有方向**的。
  *   往返一次时，去程与回程各丢一次、方向相反，两者会部分抵消；于是最终
@@ -206,17 +228,81 @@
  *
  * 补偿办法：锁定期间把"本来该积进去"的增量（与积分分支用逐字相同的梯形公式）
  * 存进一个 0.25s 的环形缓冲；解锁的那一刻，把这 0.25s 的和补回角度。
- *   - 为什么是 0.25s：默认加速度下 24 °/s 的坡道只有 0.042s，即使加速度
- *     降到 100 °/s² 也只要 0.24s，0.25s 足够全包住；
+ *   - 为什么是 0.25s：默认加速度 573 °/s² 下 80 °/s 的坡道 0.14s，
+ *     0.25s 能完整覆盖"加速度 ≥ 320 °/s²"的全部坡道；加速度更低的
+ *     极缓起动只能补回前 0.25s（补回的仍是同一公式的精确增量，
+ *     只是不完整，不会引入新的标度误差）；
  *   - 为什么不是全部锁定区间：更早的部分是真正的静止，补回去等于把零偏当角度；
  *   - 为什么用同一公式：补回的量就是"当初不冻结时会积进去的量"，逐位可比，
  *     所以补完等于"这段时间从未冻结"，不会引入新的标度误差；
  *   - 门限 GYRO_ZUPT_RAMP_RECOVER_MIN_DEG 挡误解锁：静止时 0.25s 的冻结积分
  *     只有 残余零偏×0.25s ≈ 0.002°，远低于 0.02°，不会污染 0.00000°。
  *   - 效果：起步不再丢坡道，往返误差与"远端停多久"解耦。 */
-#define GYRO_ZUPT_RAMP_RECOVER_ENABLE   1U
+#define GYRO_ZUPT_RAMP_RECOVER_ENABLE   GYRO_ZUPT_FREEZE_ENABLE
 #define GYRO_ZUPT_RAMP_RECOVER_SAMPLES  25U     /* 10 ms × 25 = 0.25s 环形缓冲    */
 #define GYRO_ZUPT_RAMP_RECOVER_MIN_DEG  0.02f   /* 小于此值判为噪声，不补         */
+
+/* ---- 运动段零偏回溯修正（retro correct）----------------------------------
+ * ★ 它解决的是"往返残差随行程变长而变大"这个问题：
+ *     角度误差 ≈ 零偏估计误差 ε × 运动时长 T。
+ *   T 从 90° 的 1.0s、180° 的 1.8s 一直到 360° 的 3.3s，所以同一个 ε 在
+ *   360° 上的误差是 90° 的 3.3 倍。用户实测"转一圈停在一两度、回来有时
+ *   加倍"，就是 ε 在去程/回程同号的表现（同号 ⇒ 相加 ⇒ 加倍）。
+ *
+ * ★ 为什么"提高校准精度"解决不了：校准只能估计**运动开始前**的零偏。
+ *   陀螺零偏随温度/时间缓慢漂移，运动段内那 3.3s 里真实零偏是多少，
+ *   段初的估计无从得知。于是"去程按旧零偏积完，回程才能用上新零偏"，
+ *   同向残差必然留下。
+ *
+ * ★ 本算法把"已经积错的那一段"补回来，而且不需要任何采样缓冲（RAM 只有
+ *   16.5KB/20KB，存 360° 行程的原始码要 2~3KB，放不下）：
+ *     1) 运动开始（ZUPT 1→0）：记下段起点零偏 b0 和"段内实际积分时长"的
+ *        累加器 t（只在真正做积分的拍上累加 elapsedMs，所以自动排除 ZUPT
+ *        冻结拍和掉拍跨接，与实际积分严格同口径）。
+ *     2) 运动结束（ZUPT 0→1）后进入静止：用静止样本重新估计零偏
+ *        b1 = (b0 × W + Σ原始码/70) / (W + N)，W = GYRO_RETRO_BIAS_PRIOR_WEIGHT，
+ *        N 最多 GYRO_RETRO_BIAS_MAX_SAMPLES 拍。这里用**原始未补偿**的
+ *        measuredRateDps 累加，避免和偏置慢跟踪互相污染。
+ *     3) 修正量 = −(b1 − b0) × t × (1 − RAMP/2)。RAMP = 0 表示"整段零偏恒为
+ *        b1"（段内零偏稳定的场景最优）；RAMP = 1 表示"整段从 b0 线性过渡到
+ *        b1"（段内均匀漂移的场景最优）；RAMP = 0.5 是两者折中。
+ *     4) 修正量按 GYRO_RETRO_SLEW_DPS 限速平滑加到角度上。限速的原因：修正
+ *        量直接阶跃会在静止曲线上留下一个 1~2° 的台阶，肉眼可见；限速后
+ *        它摊成 0.3~1s 的平滑滑动，而静止时角度本来就在 ZUPT 锁定下不动，
+ *        这点滑动不会被误读成真实运动。
+ *     5) 累积到 GYRO_RETRO_CREEP_MAX_SAMPLES 拍后冻结，避免长时间静止时
+ *        角度一直跟着零偏估计游走。
+ *
+ * ★ 与"每站重新校准（0x322=01）"互补而不重复：重校准只改 bias，影响的是
+ *   **后续**积分；回溯修正改的是**已经积完**的那一段角度。两者修的是
+ *   同一误差的前后两半，不会叠加两次。
+ * ★ 置 0U 可整体关闭，角度退回"只靠段初零偏"的行为，便于 A/B 对比。 */
+#define GYRO_RETRO_CORRECT_ENABLE       0U
+#if (GYRO_ZUPT_FREEZE_ENABLE == 0U) && \
+	((GYRO_BIAS_TRACK_ENABLE != 0U) || (GYRO_RETRO_CORRECT_ENABLE != 0U))
+#error "Continuous measurement requires fixed bias and no retroactive correction"
+#endif
+#define GYRO_RETRO_BIAS_PRIOR_WEIGHT    10.0f  /* 段初零偏的等效样本数（先验权重）。
+                                                * 段末静止 250 拍时 N/(W+N) ≈ 0.96，
+                                                * 即"旧零偏只占 4% 权重"，段末估计基本
+                                                * 说了算；又不会因为几十拍坏样本翻车。 */
+#define GYRO_RETRO_BIAS_MAX_SAMPLES     500U   /* 静止块平均窗口上限（5 s）      */
+#define GYRO_RETRO_BIAS_MAX_RATE_DPS    3.0f   /* 参与块平均的 |补偿后角速度| 上限，
+                                                * 挡住减速尾巴和轻微振动          */
+#define GYRO_RETRO_BIAS_RAMP            0.2f   /* 0=整段用 b1（段内零偏稳定时最优），
+                                                * 1=整段 b0→b1 线性（段内均匀漂移时最优）。
+                                                * 系数 = 1 − RAMP/2 = 0.9：往返同号残差
+                                                * 是"段内零偏稳定"的特征，取小值一次修掉
+                                                * 九成；留 0.1 的余量防过度修正。 */
+#define GYRO_RETRO_SLEW_DPS             1.5f   /* 修正量平滑速率上限（°/s）       */
+#define GYRO_RETRO_CREEP_MAX_SAMPLES    250U   /* 平滑修正最多跟 250 拍（2.5 s）  */
+#define GYRO_RETRO_MIN_SEGMENT_MS       100U   /* 段内积分时长短于此值不修正      */
+#define GYRO_RETRO_MIN_STATIC_SAMPLES   80U    /* 静止样本不足 0.8s 就放弃本次修正 */
+#define GYRO_RETRO_MIN_CORRECTION_DEG   0.03f  /* 修正量小于此值直接丢掉（噪声级） */
+#define GYRO_RETRO_MAX_CORRECTION_DEG   5.0f   /* 安全阀：修正量超过此值判为异常段
+                                                * （多半是静止样本里混进了坏数据），
+                                                * 整段放弃，宁可不修也不能把好角度
+                                                * 一次推歪好几度。 */
 #define GYRO_BIAS_TRACK_GAIN        0.0025f /* 外层：静止时偏置跟踪步长（≈4s 收敛时间常数）*/
 /* 内层平均：先对"补偿后角速度"做一级 τ≈0.5s 的滑动平均，再喂给外层积分器。
  * ★ 为什么必须有它：单级积分器的零偏抖动 σ ≈ σ_noise × √(g/2)。实测静止噪声
@@ -255,7 +341,7 @@
  *   gyroDbgZuptLostDeg      ZUPT 冻结期间丢掉的角度（°，手动清零）
  *                           ← 判"慢转被吃掉多少"，和 accumulatedAngleDeg 同量纲
  *   gyroDbgHoldRunMax       上电以来 zuptCounter 达到过的最大值（< 50 永远进不了静止）
- *   gyroDbgHistOver[i]      |值| 超过 2/4/8/12/20/32 dps 的累计样本数（i = 0..5）
+ *   gyroDbgHistOver[i]      |值| 超过 4/8/20/40/60/80 dps 的累计样本数（i = 0..5）
  *   gyroDbgHistSamples      累计参与统计的样本数（60s ≈ 6000）
  *   ↑ gyroDbgHistOver[i] / gyroDbgHistSamples 就是该阈值的"单样本误判率 p"，
  *     50 连击成功率 ≈ (1-p)^50：p = 1% 时只有 60%，p = 5% 时只剩 7.7%。
@@ -265,7 +351,7 @@
  * 所有 "*Hold"、hist 和 capture 都只在手动写 0 时清零。
  * ★ 调完参数务必把 GYRO_ZUPT_DEBUG_STATS_ENABLE 改回 0U 再发布。
  * ------------------------------------------------------------------------- */
-#define GYRO_ZUPT_DEBUG_STATS_ENABLE 1U
+#define GYRO_ZUPT_DEBUG_STATS_ENABLE 0U
 
 #if (GYRO_ZUPT_DEBUG_STATS_ENABLE != 0U) && (GYRO_DRIFT_SUPPRESS_ENABLE != 0U)
 #define GYRO_ZUPT_DEBUG_ACTIVE 1U
@@ -280,16 +366,30 @@
  *              1234567 → 12.34567°。int32 上限对应 ±21474.83°
  *   byte[4..5] 有符号 int16 温度，单位 0.01 摄氏度（温度分辨率保持 0.01℃）
  *   byte[6]    bit0=角度/采样有效，bit1=温度有效，
- *              bit2=零偏校准完成，bit3=零偏校准失败，bit4=判定静止（角度已锁定），
- *              bit5=校准降级（峰峰值超限但均值可用，零偏取自均值，角度仍有效）
+ *              bit2=零偏校准完成，bit3=零偏校准失败，bit4=判定静止，
+ *              bit5=校准降级，bit6=连续积分（即使 bit4=1 也不冻结角度）
  *   byte[7]    最近两次采样间隔，单位 ms，最大 255
  * 0x323 / DLC=4 角速度帧（与 0x321 同一次快照发出，两者严格同源）：
  *   byte[0..3] 有符号 int32 滤波后角速度，单位 0.00001 °/s（1e-5 °/s），小端
  *              上位机除以 100000 即得 °/s，例如 123400 → 1.234 °/s，
  *              1234567 → 12.34567 °/s。int32 上限对应 ±21474.83 °/s，
  *              而陀螺仪满量程只有 ±100 °/s，余量充足不会饱和
- *              ★ 送的是 gyroRateFilteredDps（零偏补偿 + 中值 + 低通之后的值），
+ *              ★ 送的是 gyroRateFilteredDps（零偏补偿 + 可选中值 + 低通之后的值），
  *                正是参与积分的那一路，便于和 0x321 的角度对照排查
+ * 0x324 / DLC=8 原始采样帧（与 0x321/0x323 同一次快照发出，用于离线分析滤波器）：
+ *   byte[0..1] 有符号 int16 陀螺仪原始 SPI 码（16 bit 补码，小端）
+ *              按实测 70 LSB/(°/s) 换算，1 LSB ≈ 0.014286 °/s
+ *   byte[2..5] 无符号 uint32 本次采样的实际时刻（HAL_GetTick()，ms，小端）
+ *              ★ 这是"读完 SPI 那一刻"的时间戳，不是任务唤醒时刻，
+ *                用它算 dt 才能反映真实采样间隔（含任务抖动与 SPI 耗时）
+ *   byte[6..7] 有符号 int16 当前零偏，单位 0.001 °/s（raw = 零偏 × 1000）
+ *              零偏包含校准均值和静止时的慢跟踪修正，是下方 corrected 的减数
+ * 0x325 / DLC=8 滤波明细帧：
+ *   byte[0..3] 有符号 int32 滤波后角速度，单位 0.00001 °/s（与 0x323 同值）
+ *   byte[4..7] 无符号 uint32 采样时刻（ms），与 0x324 的 byte[2..5] 相同。
+ *              ★ 两帧都带同一时间戳，上位机据此配对；缺帧时不会错配到上一拍。
+ * ★ 0x324/0x325 只在产生新样本时发送；读取失败的周期不发，避免把上一拍的值
+ *   重复记成新样本。正常 10ms 一拍，两帧共 16 字节，1 Mbps 下占用可忽略。
  * 上电后先等待 1s，再要求传感器保持静止并采集 200 个样本；校准检查峰峰波动
  * 不超过 2°/s 且平均偏置不超过 10°/s。
  * ★ 校准判据分三档，避免一次震动把角度永久锁死（旧版失败后停在 state 3 不再重试，
@@ -299,7 +399,8 @@
  *     3) 均值也超限             -> 本轮失败，2s 后自动重试（gyroCalibrationRetryCount 计数）。
  * 0x322 / DLC=1 命令帧：0x01=重新零偏校准，0x02=角度清零。
  * 命令由 task_can_rx 置标志，实际状态只由 task_gyro 修改。
- * ★ 0x321 与 0x323 每 100ms 连发一次，共用同一次临界区快照，发送结果分别判断。
+ * ★ 0x321/0x323/0x324/0x325 每 10ms 连发一次，共用同一次临界区快照，发送结果分别判断。
+ *   0x324/0x325 只在产生新样本时发送（见 gyroSampleSequence 的说明）。
  * ★ 角度比例是板端与上位机的硬约定，必须成对修改，否则角度整体差整数倍且不报错：
  *     板端 CAN_GYRO_ANGLE_SCALE  <-->  上位机 GyroProtocol.AngleLsbPerDegree
  *   2026-10-16：比例由 100（0.01°）提高到 100000（0.00001°），对应上位机 5 位小数显示。
@@ -316,12 +417,17 @@
 #define CAN_GYRO_DATA_STD_ID        0x321U
 #define CAN_GYRO_RATE_STD_ID        0x323U
 #define CAN_GYRO_COMMAND_STD_ID     0x322U
+#define CAN_GYRO_RAW_STD_ID         0x324U
+#define CAN_GYRO_RAWDETAIL_STD_ID   0x325U
 #define CAN_GYRO_CMD_RECALIBRATE    0x01U
 #define CAN_GYRO_CMD_ZERO_ANGLE     0x02U
 #define CAN_GYRO_DATA_DLC           8U
 #define CAN_GYRO_RATE_DLC           4U
+#define CAN_GYRO_RAW_DLC            8U
+#define CAN_GYRO_RAWDETAIL_DLC      8U
 #define CAN_GYRO_ANGLE_SCALE        100000.0f /* 角度帧比例：0.00001° 每 LSB（1e-5 度） */
 #define CAN_GYRO_RATE_SCALE         100000.0f /* 角速度帧比例：0.00001 °/s 每 LSB（1e-5 °/s） */
+#define CAN_GYRO_BIAS_SCALE         1000.0f   /* 零偏帧比例：0.001 °/s 每 LSB（int16 饱和） */
 
 /* 课题指定的测试数据：SPI 和 CAN 各发 1 个字节 0xAA */
 #define SPI_TEST_DATA               0xAAU
@@ -401,6 +507,9 @@ volatile uint8_t  gyroCfgDspCtl3 = 0U;
 volatile int16_t  gyroTempRaw = 0;
 volatile int16_t  gyroRateRaw = 0;volatile float    gyroTempCelsius = 0.0f;
 volatile float    gyroRateDps = 0.0f;
+volatile uint32_t gyroIntegrationGapCount = 0U; /* >50 ms 的不可恢复积分空洞 */
+volatile uint8_t gyroAngleIntegrityLost = 0U; /* 锁存到显式建立新角度原点 */
+volatile uint32_t gyroRejectedCalibrationCount = 0U;
 volatile uint32_t gyroReadCount = 0U;
 volatile uint32_t gyroErrCount = 0U;
 /* |角速度| 超过量程 (±100 °/s) 的样本数。这些样本仍然参与积分（丢时间的代价更大），
@@ -409,6 +518,8 @@ volatile uint32_t gyroSaturatedCount = 0U;
 /* 课题六采样与校准监视量：校准状态 0=稳定等待、1=采样、2=完成、3=失败（会自动重试）。 */
 volatile float gyroBiasDps = 0.0f;volatile float gyroRateCorrectedDps = 0.0f;
 volatile float gyroRateFilteredDps = 0.0f;
+volatile uint8_t gyroIntegrationMedianEnabled = GYRO_INTEGRATION_MEDIAN3_ENABLE;
+volatile uint8_t gyroAngleFreezeEnabled = GYRO_ZUPT_FREEZE_ENABLE;
 volatile float gyroAccumulatedAngleDeg = 0.0f;volatile float gyroCalibrationRangeDps = 0.0f;
 volatile uint8_t gyroCalibrationState = 0U;
 volatile uint8_t gyroDataValid = 0U;
@@ -416,19 +527,37 @@ volatile uint8_t gyroTempValid = 0U;
 volatile uint32_t gyroCalibrationSampleCount = 0U;
 volatile uint32_t gyroCalibrationFailCount = 0U;
 volatile uint32_t gyroCalibrationRetryCount = 0U;
-/* 1 = 当前零偏来自“降级”校准：峰峰值超限（多半是桌面震动/碰线），但均值仍在
- * ±GYRO_CALIBRATION_MAX_BIAS_DPS 内，于是先用均值当零偏、让角度能显示，
- * 后续静止时由偏置慢跟踪把残余零偏继续收掉。0x321 状态位 bit5 会标出来。 */
+volatile uint32_t gyroCalibrationValidationSamples = 0U;
+volatile float gyroCalibrationValidationResidualDps = 0.0f;
+volatile float gyroCalibrationValidationPeakDps = 0.0f;
+volatile uint8_t gyroCalibrationValidationPassed = 0U;
+/* 峰峰值、采样完整性或独立验证不合格时标记降级；bit5 对外报告。
+ * 均值仍可用于显示，但固定零偏不会自行收敛，不能判精度合格。 */
 volatile uint8_t gyroCalibrationDegraded = 0U;
 volatile uint32_t gyroCalibrationDegradedCount = 0U;
 volatile uint32_t gyroSampleIntervalMs = 0U;
 volatile uint32_t gyroOverrunCount = 0U;
-/* 课题六 CAN 发送计数：Ok/Err 是 0x321 与 0x323 两帧的合计，RateOk/RateErr 只统计
- * 0x323 角速度帧。两个计数放在一起对比，就能看出是哪一帧发送失败。 */
+/* 离线分析用的采样快照（0x324/0x325 两帧的数据源）：
+ *   gyroRawCode       本次采样的陀螺仪原始 SPI 码（16 bit 补码）
+ *   gyroSampleTickMs  读完 SPI 那一刻的 HAL tick（ms），即"实际采样时间戳"
+ *   gyroSampleSequence 每成功读到一个新样本 +1；task_can_tx 靠它判断
+ *                      "这一拍有没有新数据"，读取失败时不上报上一拍的旧值
+ * 三者与 gyroBiasDps / gyroRateFilteredDps 在同一个临界区快照里发布，
+ * 保证一帧记录里的原始码、零偏、滤波值属于同一拍。 */
+volatile int16_t  gyroRawCode = 0;
+volatile uint32_t gyroSampleTickMs = 0U;
+volatile uint32_t gyroSampleSequence = 0U;
+/* 课题六 CAN 发送计数：Ok/Err 是 0x321/0x323/0x324/0x325 四帧的合计，
+ * RateOk/RateErr 只统计 0x323 角速度帧，RawOk/RawErr 只统计 0x324/0x325
+ * 原始采样帧。分开计数就能看出是哪一帧发送失败。 */
 volatile uint32_t gyroCanTxOkCount = 0U;
 volatile uint32_t gyroCanTxErrCount = 0U;
 volatile uint32_t gyroCanTxRateOkCount = 0U;
 volatile uint32_t gyroCanTxRateErrCount = 0U;
+volatile uint32_t gyroCanTxRawOkCount = 0U;
+volatile uint32_t gyroCanTxRawErrCount = 0U;
+volatile uint32_t gyroCanRawPairDropCount = 0U;
+volatile uint32_t gyroCanSkippedSampleCount = 0U;
 volatile uint32_t gyroCanRxCommandCount = 0U;
 volatile uint32_t gyroCanRxProtocolErrCount = 0U;
 volatile uint8_t gyroRequestRecalibration = 0U;
@@ -443,6 +572,19 @@ volatile uint32_t gyroZuptFrozenSamples = 0U;
 volatile uint32_t gyroBiasTrackUpdateCount = 0U;
 volatile float    gyroBiasTrackDeltaDps = 0.0f;
 volatile float    gyroAngleDriftDps = 0.0f;
+
+/* 运动段零漂回溯修正的监视量（GYRO_RETRO_CORRECT_ENABLE 关闭时保持 0）：
+ *   gyroRetroEstimateDps      = 最近一段运动结束后，用静止样本重新估出的零偏
+ *   gyroRetroLastCorrectionDeg= 最近一次的段角度修正量（正 = 角度被加回来）
+ *   gyroRetroCorrectionDeg    = 上电以来累计补进角度的量
+ *   gyroRetroSettleCount      = 已完成结算的段数
+ * 若 LastCorrection 长期在 ±0.05° 内、SettleCount 在涨，说明零偏稳定、无需修正；
+ * 若 |LastCorrection| 持续 0.5° 以上，说明段初零偏确实偏了，修正在起作用。 */
+volatile float    gyroRetroEstimateDps = 0.0f;
+volatile float    gyroRetroLastCorrectionDeg = 0.0f;
+volatile float    gyroRetroCorrectionDeg = 0.0f;
+volatile uint32_t gyroRetroSettleCount = 0U;
+volatile uint32_t gyroRetroRejectCount = 0U;   /* 被 GYRO_RETRO_MAX_CORRECTION_DEG 挡下的段数 */
 
 #if (GYRO_ZUPT_DEBUG_ACTIVE != 0U)
 /* 调参统计的滚动窗口（每秒刷新一次，Watch 里读到的就是"最近一秒"） */
@@ -465,8 +607,8 @@ volatile uint32_t gyroDbgHoldDropCount = 0U;
 volatile uint32_t gyroDbgRateDropCount = 0U;
 volatile uint32_t gyroDbgStepDropCount = 0U;
 /* 滞回判据的两档出场计数（只在 GYRO_ZUPT_JUDGE_HYSTERESIS = 1 时有意义）：
- *   gyroDbgFastExitCount  tier-1 单拍解锁次数（> 24 °/s，真实高速转动）
- *   gyroDbgSlowExitCount  tier-2 连击解锁次数（12~24 °/s，慢转或持续噪声）
+ *   gyroDbgFastExitCount  tier-1 单拍解锁次数（> 80 °/s，真实高速转动）
+ *   gyroDbgSlowExitCount  tier-2 连击解锁次数（40~80 °/s，慢转或持续噪声）
  * 静止台上跑一分钟，这两个数都应该是 0；只有真正转动时才会增长。 */
 volatile uint32_t gyroDbgFastExitCount = 0U;
 volatile uint32_t gyroDbgSlowExitCount = 0U;
@@ -488,7 +630,7 @@ volatile uint32_t gyroDbgJudgeFailCount = 0U;
  * 判读：静止时它只有"残余零偏×时间"，很小；慢速转动（< ZUPT 阈值）时它就是
  * 被吃掉的那部分角度。整圈 360° 少读 1.3°，这里就应该读到 ≈ -1.3。 */
 volatile float    gyroDbgZuptLostDeg = 0.0f;
-/* 累计分布：|补偿后角速度| 超过 2/4/8/12/20/32 °/s 的样本数（手动写 0 清零） */
+/* 累计分布：|补偿后角速度| 超过 4/8/20/40/60/80 °/s 的样本数（手动写 0 清零） */
 #define GYRO_DBG_HIST_BINS 6U
 volatile uint32_t gyroDbgHistOver[GYRO_DBG_HIST_BINS] = {0U, 0U, 0U, 0U, 0U, 0U};
 volatile uint32_t gyroDbgHistSamples = 0U;
@@ -858,8 +1000,10 @@ static float GyroAbsF(float value)
 #endif
 
 /* 10ms 周期角速度采样、静止零偏校准和梯形积分。温度每秒读取一次。
- * 偏置校正后的角速度先过 3 点中值抑制孤立尖峰，再过约 5Hz 一阶 IIR，
- * 滤波后的角速度才参与梯形积分。
+ * 积分默认用偏置补偿后的原值经过约 5Hz 线性低通，避免中值改变积分面积。
+ * 校准和静止判定仍独立使用中值；旧积分中值链可通过宏启用做 A/B。
+ * 每成功读到一个样本就记下原始码与"读完 SPI 那一刻"的 tick，并通过
+ * gyroSampleSequence +1 通知 task_can_tx 发送 0x324/0x325（离线分析用）。
  * 积分之前还有一道"零漂抑制"：判定静止（ZUPT）时锁定角度并把残余零偏慢慢
  * 收进 bias，避免静止时角度持续单向漂移，详见文件上方 GYRO_DRIFT_SUPPRESS_* 说明。
  * SPI 正常传输远短于周期，但超时仍可能延长本周期，这不代表硬实时保证。 */
@@ -876,22 +1020,34 @@ static void task_gyro(void const *argument)
 	uint32_t attemptIntervalMs;
 	uint32_t elapsedMs;
 	uint32_t sampleStartMs;
-	float calibrationSum = 0.0f;
+	double calibrationSum = 0.0;
+	double calibrationValidationSum = 0.0;
+	double calibrationValidationBlockSum = 0.0;
+	float calibrationValidationPeak = 0.0f;
+	float calibrationValidationResidual = 0.0f;
+	uint8_t calibrationDataFault = 0U;
+	uint8_t calibrationValidationPassed = 0U;
 	float calibrationMin = 0.0f;
 	float calibrationMax = 0.0f;
-	float calibrationMean;
+	float calibrationMean = 0.0f;
 	float biasDps = 0.0f;
 	float correctedRateDps = 0.0f;
 	float filteredRateDps = 0.0f;
 	float previousFilteredRateDps = 0.0f;
-	float medianRateDps;
+	float integrationInputDps;
 	float filterAlpha;
 	float filterSamples[3] = {0.0f, 0.0f, 0.0f};
 	float accumulatedAngleDeg = 0.0f;
 	float measuredRateDps = 0.0f;
 	float tempCelsius = 0.0f;
 	float dtSeconds;
+	int16_t rawCode = 0;                  /* 本拍陀螺仪原始 SPI 码                  */
+	uint32_t sampleTickMs = 0U;           /* 读完 SPI 那一刻的 HAL tick（ms）        */
+	uint32_t sampleSequence = 0U;         /* 成功样本序号，供 CAN 帧判断新旧         */
 	uint32_t calibrationCount = 0U;
+	float calibrationFilterSamples[3] = {0.0f, 0.0f, 0.0f};
+	uint8_t calibrationFilterIndex = 0U;
+	float calibrationSample = 0.0f;        /* 3 拍中值后的校准输入（抗孤立尖峰）      */
 	uint32_t calibrationFailMs = 0U;      /* 本轮校准判失败的时刻，用于自动重试计时  */
 	uint8_t calibrationDegraded = 0U;     /* 1 = 本轮零偏是降级均值法得到的          */
 	uint8_t stableEnough;
@@ -923,8 +1079,10 @@ static void task_gyro(void const *argument)
 #if (GYRO_ZUPT_JUDGE_HYSTERESIS != 0U)
 	uint8_t zuptExitCounter = 0U;          /* 锁定时连续超阈值的拍数（出场确认）      */
 #endif
-#if (GYRO_ZUPT_RAMP_RECOVER_ENABLE != 0U)
+#if ((GYRO_ZUPT_RAMP_RECOVER_ENABLE != 0U) || (GYRO_RETRO_CORRECT_ENABLE != 0U))
 	uint8_t zuptWasActive = 0U;            /* 上一拍的锁定状态，用来抓 1→0 的跳变      */
+#endif
+#if (GYRO_ZUPT_RAMP_RECOVER_ENABLE != 0U)
 	/* 起步坡道补偿缓冲：锁定期间"本来会积进去"的角度增量，解锁时整体补回。
 	 * 用 static 放在 .bss 而不是任务栈上：这是 100 字节，任务栈只有 1KB，
 	 * 而它只在 task_gyro 里用（单任务访问，不需要额外保护）。 */
@@ -936,6 +1094,21 @@ static void task_gyro(void const *argument)
 	float judgeSamples[3] = {0.0f, 0.0f, 0.0f};
 	uint8_t judgeIndex = 0U;
 	uint8_t judgeFilled = 0U;              /* 已攒了几拍，不足 3 拍先按原值走         */
+#endif
+#if (GYRO_RETRO_CORRECT_ENABLE != 0U)
+	/* 运动段状态：段起点零偏 + 段内实际积分时长 */
+	uint8_t retroSegActive = 0U;           /* 1 = 正在一段运动里                      */
+	uint32_t retroSegDtMs = 0U;            /* 段内真正做积分的累计时长（ms）          */
+	float retroSegStartBiasDps = 0.0f;     /* 段起点用的零偏                          */
+	/* 段结束后的静止块平均：用原始未补偿角速度，避免和偏置慢跟踪互相污染 */
+	float retroStaticSumDps = 0.0f;
+	uint32_t retroStaticCount = 0U;
+	uint8_t retroPending = 0U;             /* 1 = 段已结束，等静止样本攒够再算修正    */
+	/* 修正量的平滑应用 */
+	uint8_t retroApplyActive = 0U;
+	uint32_t retroApplySamples = 0U;
+	float retroApplyRemainDeg = 0.0f;      /* 还没补完的角度（°/s 限速地靠近 0）      */
+	float retroApplyTotalDeg = 0.0f;       /* 已累计补进去的角度，仅用于 Watch        */
 #endif
 #endif
 #if (GYRO_ZUPT_DEBUG_ACTIVE != 0U)
@@ -971,10 +1144,24 @@ static void task_gyro(void const *argument)
 		if (requestZeroAngle != 0U)
 		{
 			accumulatedAngleDeg = 0.0f;
+			gyroAngleIntegrityLost = 0U;
 			havePreviousRate = 0U;
 			/* 角度清零后漂移统计窗口一起重来，避免把清零前的变化算进去 */
 			driftWindowStartMs = 0U;
 			angleDriftDps = 0.0f;
+#if (GYRO_RETRO_CORRECT_ENABLE != 0U)
+			/* 清零等于"把此刻定义为 0°"。上一段的回溯修正量如果还没滑完，
+			 * 它的基准（零偏假设）属于被清零掉的那段历史，继续补会把
+			 * "别的段的误差"加到新基准上，必须一起作废。 */
+			retroSegActive = 0U;
+			retroSegDtMs = 0U;
+			retroPending = 0U;
+			retroStaticSumDps = 0.0f;
+			retroStaticCount = 0U;
+			retroApplyActive = 0U;
+			retroApplyRemainDeg = 0.0f;
+			retroApplySamples = 0U;
+#endif
 #if (GYRO_DRIFT_SUPPRESS_ENABLE != 0U)
 			/* ★ 清零 = “把此刻的物理位置定义为 0°”，必须同时把静止判据补满。
 			 *   否则清零前刚转动过（计数器为 0），之后 0.5s 的静止确认窗口里
@@ -1003,10 +1190,24 @@ static void task_gyro(void const *argument)
 #endif
 		}
 
+#if (GYRO_DRIFT_SUPPRESS_ENABLE != 0U)
+		/* 已在运动时拒绝重校准，避免整段运动在校准窗口内被漏积。 */
+		if ((requestRecalibration != 0U) && (calibrationState == 2U) && (zuptActive == 0U))
+		{
+			requestRecalibration = 0U;
+			gyroRejectedCalibrationCount++;
+		}
+#endif
 		if (requestRecalibration != 0U)
 		{
 			calibrationCount = 0U;
 			calibrationSum = 0.0f;
+			calibrationValidationSum = 0.0;
+			calibrationValidationBlockSum = 0.0;
+			calibrationValidationPeak = 0.0f;
+			calibrationValidationResidual = 0.0f;
+			calibrationValidationPassed = 0U;
+			calibrationDataFault = 0U;
 			calibrationMin = 0.0f;
 			calibrationMax = 0.0f;
 			calibrationState = 1U;
@@ -1035,8 +1236,14 @@ static void task_gyro(void const *argument)
 		}
 
 		readTemp = ((sampleStartMs - lastTempMs) >= GYRO_TEMP_PERIOD_MS) ? 1U : 0U;
-		if (XV7001bb_ReadAngleDps(&measuredRateDps) == HAL_OK)
+		if (XV7001bb_ReadAngle(&rawCode) == HAL_OK)
 		{
+			measuredRateDps = XV7001bb_AngleToDps(rawCode);
+			/* 实际采样时刻取"读完 SPI 那一刻"：sampleStartMs 是任务唤醒时刻，
+			 * 与真正拿到数据相差一个 SPI 事务。0x324/0x325 记录这个值，
+			 * 离线用相邻样本的差算 dt，才能看到任务抖动和读取耗时。 */
+			sampleTickMs = HAL_GetTick();
+
 			/* 只挡物理上不可能的读数（见 XV7001BB_VALID_RATE_DPS 的说明）。
 			 * 量程内饱和照样算有效：丢一拍会连带丢掉下一拍的 dt，代价是 2° 级的。 */
 			dataValid = ((measuredRateDps <= XV7001BB_VALID_RATE_DPS) &&
@@ -1055,48 +1262,145 @@ static void task_gyro(void const *argument)
 		{
 			if (lastSuccessfulReadMs != 0U)
 			{
-				sampleIntervalMs = sampleStartMs - lastSuccessfulReadMs;
+				sampleIntervalMs = sampleTickMs - lastSuccessfulReadMs;
 			}
-			lastSuccessfulReadMs = sampleStartMs;
+			lastSuccessfulReadMs = sampleTickMs;
 			gyroReadCount++;
+			sampleSequence++;
+			/* --- 掉拍跨接的空洞上限 ----------------------------------------
+			 * 读失败不再销毁积分状态（见下面的 else 分支），所以恢复后的那一拍
+			 * 可能面对一个很大的 elapsedMs。空洞超过 GYRO_MAX_BRIDGE_MS 说明采样
+			 * 已经不可信，这时才把积分/ZUPT/滤波状态整体作废重来，避免用一个
+			 * 陈旧角速度乘一个很大的 dt。 */
+			if ((havePreviousRate != 0U) &&
+				((sampleTickMs - previousValidMs) > GYRO_MAX_BRIDGE_MS))
+			{
+				gyroIntegrationGapCount++;
+				gyroAngleIntegrityLost = 1U;
+				havePreviousRate = 0U;
+				filterPrimed = 0U;
+				driftWindowStartMs = 0U;
+#if (GYRO_DRIFT_SUPPRESS_ENABLE != 0U)
+				zuptCounter = 0U;
+				zuptActive = 0U;
+				havePreviousJudge = 0U;
+				biasTrackPrimed = 0U;
+#if (GYRO_ZUPT_JUDGE_HYSTERESIS != 0U)
+				zuptExitCounter = 0U;
+#endif
+#if (GYRO_ZUPT_RAMP_RECOVER_ENABLE != 0U)
+				/* 空洞跨越了无效区间，缓冲里的增量没有意义 */
+				rampRecoverCount = 0U;
+				rampRecoverIndex = 0U;
+#endif
+#if (GYRO_ZUPT_JUDGE_MEDIAN3 != 0U)
+				judgeFilled = 0U;
+#endif
+#endif
+			}
 			correctedRateDps = measuredRateDps - biasDps;
 
 			if (calibrationState == 1U)
 			{
+				if ((calibrationCount > 0U) && (sampleIntervalMs > GYRO_MAX_BRIDGE_MS))
+				{
+					calibrationDataFault = 1U;
+				}
+				/* --- 3 拍中值前置滤波 ----------------------------------------
+				 * 零偏采用静止窗口算术平均，对孤立尖峰毫无抵抗力：实测出现过单拍
+				 * 2865 码 ≈ 40.9 °/s 的 SPI 损坏样本，它一个人就把均值拉偏
+				 * 40.9/200 ≈ 0.20 °/s —— 折成角度就是每 2s 行程少算 0.4°，而且
+				 * 还会把峰峰值判据顶穿，让一次干净的校准被误判成"降级"。
+				 * 中值滤波对孤立尖峰完全免疫，代价只有 2 拍（20ms）延迟，
+				 * 相对 20s 的校准窗口很短。 */
 				if (calibrationCount == 0U)
 				{
-					calibrationMin = measuredRateDps;
-					calibrationMax = measuredRateDps;
+					calibrationFilterSamples[0] = measuredRateDps;
+					calibrationFilterSamples[1] = measuredRateDps;
+					calibrationFilterSamples[2] = measuredRateDps;
+					calibrationFilterIndex = 0U;
 				}
 				else
 				{
-					if (measuredRateDps < calibrationMin)
+					calibrationFilterSamples[calibrationFilterIndex] = measuredRateDps;
+					calibrationFilterIndex = (uint8_t)
+						((calibrationFilterIndex + 1U) % 3U);
+				}
+				calibrationSample = GyroMedianOfThree(
+					calibrationFilterSamples[0],
+					calibrationFilterSamples[1],
+					calibrationFilterSamples[2]);
+
+				if (calibrationCount == 0U)
+				{
+					calibrationMin = calibrationSample;
+					calibrationMax = calibrationSample;
+				}
+				else
+				{
+					if (calibrationSample < calibrationMin)
 					{
-						calibrationMin = measuredRateDps;
+						calibrationMin = calibrationSample;
 					}
-					if (measuredRateDps > calibrationMax)
+					if (calibrationSample > calibrationMax)
 					{
-						calibrationMax = measuredRateDps;
+						calibrationMax = calibrationSample;
 					}
 				}
-				calibrationSum += measuredRateDps;
+				if (calibrationCount < GYRO_CALIBRATION_SAMPLES)
+				{
+					calibrationSum += (double)calibrationSample;
+				}
+				else
+				{
+					/* 验证使用线性积分实际接收的原始信号，而不是中值。 */
+					calibrationValidationSum += (double)measuredRateDps;
+					calibrationValidationBlockSum += (double)measuredRateDps;
+				}
 				calibrationCount++;
 
-				if (calibrationCount >= GYRO_CALIBRATION_SAMPLES)
+				if (calibrationCount == GYRO_CALIBRATION_SAMPLES)
 				{
-					calibrationMean = calibrationSum / (float)calibrationCount;
+					calibrationMean = (float)(calibrationSum / GYRO_CALIBRATION_SAMPLES);
+				}
+				if (calibrationCount > GYRO_CALIBRATION_SAMPLES)
+				{
+					uint32_t validationCount = calibrationCount - GYRO_CALIBRATION_SAMPLES;
+					calibrationValidationResidual =
+						(float)(calibrationValidationSum / validationCount) - calibrationMean;
+					if ((validationCount % GYRO_CALIBRATION_VALIDATION_BLOCK_SAMPLES) == 0U)
+					{
+						float blockResidual =
+							(float)(calibrationValidationBlockSum /
+								GYRO_CALIBRATION_VALIDATION_BLOCK_SAMPLES) - calibrationMean;
+						float blockAbs = (blockResidual < 0.0f) ? -blockResidual : blockResidual;
+						if (blockAbs > calibrationValidationPeak)
+						{
+							calibrationValidationPeak = blockAbs;
+						}
+						calibrationValidationBlockSum = 0.0;
+					}
+				}
+				if (calibrationCount >=
+					(GYRO_CALIBRATION_SAMPLES + GYRO_CALIBRATION_VALIDATION_SAMPLES))
+				{
 					stableEnough =
-						((calibrationMax - calibrationMin) <= GYRO_CALIBRATION_MAX_RANGE_DPS) ? 1U : 0U;
+						(((calibrationMax - calibrationMin) <= GYRO_CALIBRATION_MAX_RANGE_DPS) &&
+						 (calibrationDataFault == 0U)) ? 1U : 0U;
 					meanUsable =
 						((calibrationMean <= GYRO_CALIBRATION_MAX_BIAS_DPS) &&
 						 (calibrationMean >= -GYRO_CALIBRATION_MAX_BIAS_DPS)) ? 1U : 0U;
+					calibrationValidationPassed =
+						((stableEnough != 0U) && (meanUsable != 0U) &&
+						 (calibrationValidationPeak <= GYRO_CALIBRATION_MAX_RESIDUAL_DPS) &&
+						 (calibrationValidationResidual <= GYRO_CALIBRATION_MAX_RESIDUAL_DPS) &&
+						 (calibrationValidationResidual >= -GYRO_CALIBRATION_MAX_RESIDUAL_DPS)) ? 1U : 0U;
 
 					/* 判据分三档，避免“一次抖动就把角度永久判死”：
-					 *   1) 峰峰值达标          -> 正常校准，零偏 = 均值；
-					 *   2) 峰峰值超标但均值可用 -> 降级校准，先用均值当零偏让角度能显示，
-					 *      静止时由偏置慢跟踪继续收敛；bit5 标记，上位机显示“校准降级”；
+					 *   1) 完整性、峰峰值和独立验证达标 -> 正常校准；
+					 *   2) 质量不足但均值可用 -> 降级校准，bit5 标记，不判精度合格；
 					 *   3) 均值也不可用（板子明显在动）-> 本轮失败，等待 RETRY_DELAY 自动重试。 */
-					if ((stableEnough != 0U) && (meanUsable != 0U))
+					if (calibrationValidationPassed != 0U)
 					{
 						calibrationDegraded = 0U;
 					}
@@ -1117,7 +1421,7 @@ static void task_gyro(void const *argument)
 					{
 						biasDps = calibrationMean;
 						calibrationState = 2U;
-						accumulatedAngleDeg = 0.0f;
+						/* 校准只更新零偏；保留累计角度和既有积分质量状态。 */
 						correctedRateDps = measuredRateDps - biasDps;
 						filterSamples[0] = correctedRateDps;
 						filterSamples[1] = correctedRateDps;
@@ -1125,11 +1429,11 @@ static void task_gyro(void const *argument)
 						filteredRateDps = correctedRateDps;
 						filterIndex = 0U;
 						filterPrimed = 1U;
-						/* 校准刚结束、角度已归零：漂移统计窗口重新开始 */
+						/* 校准刚结束：角度保持，漂移统计窗口重新开始 */
 						driftWindowStartMs = 0U;
 						angleDriftDps = 0.0f;
 #if (GYRO_DRIFT_SUPPRESS_ENABLE != 0U)
-						/* 以刚校准好的零偏作为慢跟踪基准；角度刚归零，同“清零”一样
+						/* 以刚校准好的零偏作为跟踪统计基准；校准要求静止，
 						 * 直接按“已确认静止”起步，避免残余零偏在 0.5s 确认窗口里
 						 * 被积分成 0.00x°（校准本来就要求板子静止）。 */
 						biasTrackBaseDps = biasDps;
@@ -1156,14 +1460,18 @@ static void task_gyro(void const *argument)
 			else if (calibrationState == 2U)
 			{
 				elapsedMs = (havePreviousRate != 0U) ?
-					(sampleStartMs - previousValidMs) : 0U;
+					(sampleTickMs - previousValidMs) : 0U;
 
 #if (GYRO_DRIFT_SUPPRESS_ENABLE != 0U)
 #if (GYRO_ZUPT_DEBUG_ACTIVE != 0U)
 				/* --- 调参统计：只读不改，不参与任何判定 --------------------- */
 				{
+					/* 分档阶梯：第 4 档（index 3）正好是 GYRO_ZUPT_MAX_RATE_DPS = 40，
+					 * 第 6 档（index 5）正好是 GYRO_ZUPT_EXIT_FAST_DPS = 80，
+					 * 所以 gyroDbgHistOver[3] / gyroDbgHistSamples 就是入场门限的
+					 * "单拍超阈值率"，gyroDbgHistOver[5] 监视 tier-1 的余量。 */
 					static const float histThresholds[GYRO_DBG_HIST_BINS] =
-						{2.0f, 4.0f, 8.0f, 12.0f, 20.0f, 32.0f};
+						{4.0f, 8.0f, 20.0f, 40.0f, 60.0f, 80.0f};
 					float dbgAbsRate = GyroAbsF(correctedRateDps);
 					uint8_t i;
 
@@ -1246,7 +1554,7 @@ static void task_gyro(void const *argument)
 				 * ★ GYRO_ZUPT_JUDGE_MEDIAN3 = 1 时，判据吃的是 3 拍中值：
 				 *   孤立单拍尖峰（SPI 损坏 / EMI）不再能把 0.5s 计数清零。 */
 				{
-#if (GYRO_ZUPT_RAMP_RECOVER_ENABLE != 0U)
+#if ((GYRO_ZUPT_RAMP_RECOVER_ENABLE != 0U) || (GYRO_RETRO_CORRECT_ENABLE != 0U))
 					zuptWasActive = zuptActive;
 #endif
 #if (GYRO_ZUPT_JUDGE_MEDIAN3 != 0U)
@@ -1291,7 +1599,7 @@ static void task_gyro(void const *argument)
 						}
 						else if (GyroAbsF(correctedRateDps) > GYRO_ZUPT_MAX_RATE_DPS)
 						{
-							/* tier-2：12~24 °/s，可能是噪声也可能是慢转，
+							/* tier-2：40~80 °/s，可能是噪声也可能是慢转，
 							 * 要求连续 GYRO_ZUPT_EXIT_CONFIRM_SAMPLES 拍 */
 							if (zuptExitCounter < GYRO_ZUPT_EXIT_CONFIRM_SAMPLES)
 							{
@@ -1402,7 +1710,7 @@ static void task_gyro(void const *argument)
 #if (GYRO_ZUPT_RAMP_RECOVER_ENABLE != 0U)
 				/* --- 起步坡道补偿：锁定刚刚结束，把冻结期间最后 0.25s 的角度补回 ---
 				 * 冻结期间角度不动，但平台是从静止加速上来的。解锁时角速度已经
-				 * 越过判据门限（tier-1 是 24 °/s），0→门限 这段坡道整段被丢掉了。
+				 * 越过判据门限（tier-1 是 80 °/s），0→门限 这段坡道整段被丢掉了。
 				 * 这里把"不冻结时本来会积进去"的增量原样加回去，等价于这段时间
 				 * 从未冻结，所以不会引入新的标度误差。
 				 * ★ 只在 1→0 的跳变上补一次；静止时这点增量只有零偏×0.25s≈0.002°，
@@ -1428,6 +1736,44 @@ static void task_gyro(void const *argument)
 					rampRecoverIndex = 0U;
 				}
 #endif
+#if (GYRO_RETRO_CORRECT_ENABLE != 0U)
+				/* --- 运动段零偏回溯修正：段边界处理 -------------------------
+				 * 见 GYRO_RETRO_CORRECT_ENABLE 的说明。这里只做"记账"和
+				 * "结算"，真正的平滑修正放在积分之后（只在静止拍上加）。 */
+				if ((zuptWasActive != 0U) && (zuptActive == 0U))
+				{
+					/* 1→0：一段运动开始。上一段如果还有没滑完的修正量，
+					 * 此刻平台已经在动，一次补完看不出来（README 第 7 条）。 */
+					if (retroApplyActive != 0U)
+					{
+						accumulatedAngleDeg += retroApplyRemainDeg;
+						retroApplyTotalDeg += retroApplyRemainDeg;
+						gyroRetroCorrectionDeg += retroApplyRemainDeg;
+						retroApplyRemainDeg = 0.0f;
+						retroApplyActive = 0U;
+					}
+					retroSegActive = 1U;
+					retroSegDtMs = 0U;
+					retroSegStartBiasDps = biasDps;
+					/* 上一段没攒够静止样本就又要动了：本次估计作废 */
+					retroPending = 0U;
+					retroStaticSumDps = 0.0f;
+					retroStaticCount = 0U;
+				}
+				else if ((zuptWasActive == 0U) && (zuptActive != 0U) &&
+						 (retroSegActive != 0U))
+				{
+					/* 0→1：一段运动结束（减速尾巴已积进去，锁定拍不算）。
+					 * 后面开始用静止样本重新估计零偏。 */
+					retroSegActive = 0U;
+					if (retroSegDtMs >= GYRO_RETRO_MIN_SEGMENT_MS)
+					{
+						retroPending = 1U;
+					}
+					retroStaticSumDps = 0.0f;
+					retroStaticCount = 0U;
+				}
+#endif
 #if (GYRO_ZUPT_DEBUG_ACTIVE != 0U)
 				if (zuptCounter > gyroDbgHoldRunMax)
 				{
@@ -1444,6 +1790,7 @@ static void task_gyro(void const *argument)
 					 * 步长足够小，所以不会在角度曲线上留下台阶。
 					 * 跟踪后立刻用新 bias 重算 corrected，保证下面滤波和积分拿到
 					 * 的是同一时刻的一致值。 */
+#if (GYRO_BIAS_TRACK_ENABLE != 0U)
 					if (biasTrackPrimed == 0U)
 					{
 						/* 刚进入静止：拿当前残余直接起步，避免内层从 0 慢慢爬
@@ -1456,6 +1803,69 @@ static void task_gyro(void const *argument)
 					biasDps += GYRO_BIAS_TRACK_GAIN * biasTrackAvgDps;
 					correctedRateDps = measuredRateDps - biasDps;
 					biasTrackUpdates++;
+#endif
+
+#if (GYRO_RETRO_CORRECT_ENABLE != 0U)
+					/* --- 运动段零偏回溯修正：静止块平均 + 结算 ---------------
+					 * 用**原始未补偿**的 measuredRateDps 累加，得到的均值就是
+					 * "此刻实测零偏的绝对值"；不能累加 correctedRateDps，因为
+					 * 上面的慢跟踪每拍都在改 bias，累加它会得到一个越走越小的
+					 * 伪均值。
+					 * 只收 |补偿后角速度| 很小的样本，挡住减速尾巴和轻微振动。 */
+					if ((retroPending != 0U) &&
+						(retroStaticCount < GYRO_RETRO_BIAS_MAX_SAMPLES) &&
+						(GyroAbsF(correctedRateDps) <= GYRO_RETRO_BIAS_MAX_RATE_DPS))
+					{
+						retroStaticSumDps += measuredRateDps;
+						retroStaticCount++;
+					}
+
+					if ((retroPending != 0U) &&
+						(retroStaticCount >= GYRO_RETRO_MIN_STATIC_SAMPLES))
+					{
+						/* 攒够样本，结算本段：
+						 *   新零偏 b1 = (b0 × W + Σ实测) / (W + N)
+						 *   Δb = b1 − b0
+						 *   段内实际积分时长 t（只在真正积分的拍上累加）
+						 *   修正量 = −Δb × t × (1 − RAMP/2) × 标度
+						 * 负号：bias 变小 ⇒ 原来少算了 ⇒ 角度要加回来。 */
+						float newBiasDps;
+						float deltaBiasDps;
+						float correctionDeg;
+
+						newBiasDps = (retroSegStartBiasDps *
+										  GYRO_RETRO_BIAS_PRIOR_WEIGHT +
+									  retroStaticSumDps) /
+									 (GYRO_RETRO_BIAS_PRIOR_WEIGHT +
+									  (float)retroStaticCount);
+						deltaBiasDps = newBiasDps - retroSegStartBiasDps;
+						correctionDeg = -deltaBiasDps *
+										((float)retroSegDtMs / 1000.0f) *
+										(1.0f - GYRO_RETRO_BIAS_RAMP * 0.5f) *
+										GYRO_ANGLE_SCALE_CALIBRATION;
+
+						gyroRetroEstimateDps = newBiasDps;
+						gyroRetroLastCorrectionDeg = correctionDeg;
+						gyroRetroSettleCount++;
+
+						if (GyroAbsF(correctionDeg) >= GYRO_RETRO_MIN_CORRECTION_DEG)
+						{
+							if (GyroAbsF(correctionDeg) <= GYRO_RETRO_MAX_CORRECTION_DEG)
+							{
+								retroApplyRemainDeg += correctionDeg;
+								retroApplyActive = 1U;
+								retroApplySamples = 0U;
+							}
+							else
+							{
+								/* 超过安全阀：多半是静止样本里混了坏数据，
+								 * 这 3° 以上的修正一旦打进去就再也收不回来。 */
+								gyroRetroRejectCount++;
+							}
+						}
+						retroPending = 0U;
+					}
+#endif
 				}
 				else
 				{
@@ -1475,15 +1885,18 @@ static void task_gyro(void const *argument)
 				}
 				else
 				{
+					integrationInputDps = correctedRateDps;
+#if (GYRO_INTEGRATION_MEDIAN3_ENABLE != 0U)
 					filterSamples[filterIndex] = correctedRateDps;
 					filterIndex = (uint8_t)((filterIndex + 1U) % 3U);
-					medianRateDps = GyroMedianOfThree(
+					integrationInputDps = GyroMedianOfThree(
 						filterSamples[0], filterSamples[1], filterSamples[2]);
+#endif
 					if (elapsedMs > 0U)
 					{
 						dtSeconds = (float)elapsedMs / 1000.0f;
 						filterAlpha = dtSeconds / (GYRO_LOWPASS_TAU_SECONDS + dtSeconds);
-						filteredRateDps += filterAlpha * (medianRateDps - filteredRateDps);
+						filteredRateDps += filterAlpha * (integrationInputDps - filteredRateDps);
 					}
 #if (GYRO_ZUPT_DEBUG_ACTIVE != 0U)
 					/* 同一拍的滤波后峰值：和 raw 峰值差得多，说明是高频振动/尖峰。
@@ -1503,7 +1916,7 @@ static void task_gyro(void const *argument)
 				if (havePreviousRate != 0U)
 				{
 #if (GYRO_DRIFT_SUPPRESS_ENABLE != 0U)
-					if (zuptActive != 0U)
+					if ((GYRO_ZUPT_FREEZE_ENABLE != 0U) && (zuptActive != 0U))
 					{
 						/* --- 零漂抑制第 3 步：静止锁定 -----------------------------
 						 * 已判定静止，本周期不积分：角度保持不变，残余零偏就
@@ -1539,11 +1952,63 @@ static void task_gyro(void const *argument)
 						accumulatedAngleDeg +=
 							((previousFilteredRateDps + filteredRateDps) * 0.5f) *
 							dtSeconds * GYRO_ANGLE_SCALE_CALIBRATION;
+#if (GYRO_RETRO_CORRECT_ENABLE != 0U)
+						/* 只在真正做积分的拍上累加，所以这个时长与"这段运动
+						 * 到底积了多少秒"严格同口径：ZUPT 冻结拍、被跨接的掉拍
+						 * 都不算。回溯修正量 = Δ零偏 × 这个时长。 */
+						if (retroSegActive != 0U)
+						{
+							retroSegDtMs += elapsedMs;
+						}
+#endif
 					}
 				}
 				previousFilteredRateDps = filteredRateDps;
-				previousValidMs = sampleStartMs;
+				previousValidMs = sampleTickMs;
 				havePreviousRate = 1U;
+
+#if (GYRO_RETRO_CORRECT_ENABLE != 0U)
+				/* --- 运动段零偏回溯修正：平滑应用 ---------------------------
+				 * 修正量不能阶跃加到角度上（会在静止曲线上留一个 1~2° 的台阶），
+				 * 这里按 GYRO_RETRO_SLEW_DPS 限速滑动，且**只在 ZUPT 锁定的拍**
+				 * 上加，保证运动段的角度积分不被污染。
+				 * 到 GYRO_RETRO_CREEP_MAX_SAMPLES 拍或残量归零就冻结，避免长时间
+				 * 静止时角度一直跟着零偏估计游走；冻结后剩下的量在下次起转时
+				 * 一次补完（见上面的 1→0 处理）。 */
+				if ((retroApplyActive != 0U) && (zuptActive != 0U))
+				{
+					float creepLimitDeg =
+						GYRO_RETRO_SLEW_DPS * ((float)elapsedMs / 1000.0f);
+					float creepStepDeg;
+
+					if (creepLimitDeg < 1.0e-4f)
+					{
+						creepLimitDeg = 1.0e-4f;
+					}
+					if (retroApplyRemainDeg > creepLimitDeg)
+					{
+						creepStepDeg = creepLimitDeg;
+					}
+					else if (retroApplyRemainDeg < -creepLimitDeg)
+					{
+						creepStepDeg = -creepLimitDeg;
+					}
+					else
+					{
+						creepStepDeg = retroApplyRemainDeg;
+					}
+					accumulatedAngleDeg += creepStepDeg;
+					retroApplyTotalDeg += creepStepDeg;
+					gyroRetroCorrectionDeg += creepStepDeg;
+					retroApplyRemainDeg -= creepStepDeg;
+					retroApplySamples++;
+					if ((retroApplySamples >= GYRO_RETRO_CREEP_MAX_SAMPLES) ||
+						(GyroAbsF(retroApplyRemainDeg) <= 1.0e-4f))
+					{
+						retroApplyActive = 0U;
+					}
+				}
+#endif
 
 				/* --- 零漂抑制效果监视：每 1s 算一次角度变化率 ------------------
 				 * 静止时该值越接近 0°/s，说明零漂压得越好（可以直接在 Watch 里
@@ -1610,6 +2075,12 @@ static void task_gyro(void const *argument)
 				{
 					calibrationCount = 0U;
 					calibrationSum = 0.0f;
+					calibrationValidationSum = 0.0;
+					calibrationValidationBlockSum = 0.0;
+					calibrationValidationPeak = 0.0f;
+					calibrationValidationResidual = 0.0f;
+					calibrationValidationPassed = 0U;
+					calibrationDataFault = 0U;
 					calibrationMin = 0.0f;
 					calibrationMax = 0.0f;
 					calibrationState = 1U;
@@ -1625,30 +2096,19 @@ static void task_gyro(void const *argument)
 		}
 		else
 		{
+			/* 本拍读取失败（SPI 出错或码值离谱）：只记账，不销毁积分状态。
+			 * 旧实现把 havePreviousRate 清 0，于是恢复后的那一拍 elapsedMs = 0，
+			 * 读失败前后整整两个周期（20ms）的角度被整段丢掉 —— 114.6 °/s 时
+			 * 一次掉拍就少算 2.3°，几次就足够凑出"180° 只积到 178"的假象。
+			 * 现在由下一个有效样本按真实 elapsedMs 把这段跨接积起来；只有空洞
+			 * 超过 GYRO_MAX_BRIDGE_MS 才作废重来（见上面的 gap 检查）。
+			 * 静止判定因此也不会被一次孤立掉拍打断。 */
 			gyroErrCount++;
 			dataValid = 0U;
-			havePreviousRate = 0U;
-			filterPrimed = 0U;
-			/* 本次读取失败：静止判定和漂移统计窗口一起作废，恢复后重新计时，
-			 * 避免用一段不连续的数据去判断"是否静止" */
-			driftWindowStartMs = 0U;
-#if (GYRO_DRIFT_SUPPRESS_ENABLE != 0U)
-			zuptCounter = 0U;
-			zuptActive = 0U;
-			havePreviousJudge = 0U;
-			biasTrackPrimed = 0U;
-#if (GYRO_ZUPT_JUDGE_HYSTERESIS != 0U)
-			zuptExitCounter = 0U;
-#endif
-#if (GYRO_ZUPT_RAMP_RECOVER_ENABLE != 0U)
-			/* 采样断了，缓冲里的增量跨越了无效区间，必须丢弃 */
-			rampRecoverCount = 0U;
-			rampRecoverIndex = 0U;
-#endif
-#if (GYRO_ZUPT_JUDGE_MEDIAN3 != 0U)
-			judgeFilled = 0U;
-#endif
-#endif
+			if (calibrationState == 1U)
+			{
+				calibrationDataFault = 1U;
+			}
 		}
 
 		if (readTemp != 0U)
@@ -1667,6 +2127,9 @@ static void task_gyro(void const *argument)
 
 		taskENTER_CRITICAL();
 		gyroRateDps = measuredRateDps;
+		gyroRawCode = rawCode;
+		gyroSampleTickMs = sampleTickMs;
+		gyroSampleSequence = sampleSequence;
 		gyroRateCorrectedDps = correctedRateDps;
 		gyroRateFilteredDps = filteredRateDps;
 		gyroBiasDps = biasDps;
@@ -1674,9 +2137,15 @@ static void task_gyro(void const *argument)
 		gyroCalibrationState = calibrationState;
 		gyroCalibrationDegraded = calibrationDegraded;
 		gyroCalibrationSampleCount = calibrationCount;
+		gyroCalibrationValidationSamples = (calibrationCount > GYRO_CALIBRATION_SAMPLES) ?
+			(calibrationCount - GYRO_CALIBRATION_SAMPLES) : 0U;
+		gyroCalibrationValidationResidualDps = calibrationValidationResidual;
+		gyroCalibrationValidationPeakDps = calibrationValidationPeak;
+		gyroCalibrationValidationPassed = calibrationValidationPassed;
 		gyroCalibrationRangeDps =
 			(calibrationCount > 0U) ? (calibrationMax - calibrationMin) : 0.0f;
-		gyroDataValid = dataValid;
+		/* 长缺口丢掉的角度不能靠后续成功样本恢复，禁止静默重新有效。 */
+		gyroDataValid = (dataValid != 0U && gyroAngleIntegrityLost == 0U) ? 1U : 0U;
 		gyroSampleIntervalMs = sampleIntervalMs;
 #if (GYRO_DRIFT_SUPPRESS_ENABLE != 0U)
 		/* 零漂抑制监视量（开关关闭时这些量保持 0，表示未启用） */
@@ -1733,43 +2202,66 @@ static int16_t GyroScaleToInt16(float value, float scale)
 	return (int16_t)((scaled >= 0.0f) ? (scaled + 0.5f) : (scaled - 0.5f));
 }
 
-/* 100ms 发送一致快照；测量任务在临界区更新同一组字段，避免撕裂多字节数据。
- * 每个周期连发两帧，两帧共用同一次临界区快照，所以角度、温度、角速度严格同源：
- *   0x321 / DLC=8  角度 + 温度 + 状态位 + 采样间隔（协议不变）
- *   0x323 / DLC=4  滤波后角速度，单位 0.001 °/s，小端
- * 两帧的发送返回值分别判断、分别计数，便于区分是哪一帧出问题。 */
+/* 10ms 周期的 CAN 上报。所有帧共用同一次临界区快照，保证角度、温度、
+ * 角速度、原始码、零偏严格来自同一拍：
+ *   0x321 / DLC=8  角度 + 温度 + 状态位 + 采样间隔
+ *   0x323 / DLC=4  滤波后角速度，单位 0.00001 °/s
+ *   0x324 / DLC=8  原始 SPI 码 + 实际采样时刻 + 当前零偏（仅新样本时发）
+ *   0x325 / DLC=8  滤波后角速度 + 实际采样时刻（仅新样本时发，供配对）
+ * 0x324/0x325 用 gyroSampleSequence 判断"有没有新样本"：读取失败或 SPI
+ * 超时的周期不重复上报上一拍的旧值。每帧的发送返回值分别判断、分别计数。 */
 static void task_can_tx(void const *argument)
 {
+	const TickType_t periodTicks = pdMS_TO_TICKS(CAN_TX_PERIOD_MS);
+	TickType_t lastWakeTick = xTaskGetTickCount();
 	uint8_t payload[8];
 	uint8_t ratePayload[4];
+	uint8_t rawPayload[8];
+	uint8_t detailPayload[8];
 	uint8_t statusFlags;
 	uint8_t sampleInterval;
 	uint32_t angleBits;
 	uint32_t rateBits;
+	uint32_t rawBits;
+	uint32_t tickBits;
+	uint32_t biasBits;
 	uint16_t tempBits;
 	int32_t angleRawValue;
 	int32_t rateRawValue;
 	int16_t tempCentiDegrees;
+	int16_t rawCodeSnapshot;
 	float angleDegrees;
 	float temperatureCelsius;
 	float filteredRateDps;
+	float biasDpsSnapshot;
 	uint8_t dataValid;
 	uint8_t tempValid;
 	uint8_t calibrationState;
 	uint8_t calibrationDegraded;
 	uint8_t zuptState;
 	uint32_t intervalMs;
+	uint32_t sampleTickMs;
+	uint32_t sampleSequence;
+	uint32_t lastRawSequence = 0U;
+	uint8_t rawSnapshotSent = 0U;
+	HAL_StatusTypeDef rawSendStatus;
+	HAL_StatusTypeDef detailSendStatus;
 
 	(void)argument;
 
 	for (;;)
 	{
-		/* 一次临界区同时取走三路数据的快照：角度、温度、滤波后角速度。
-		 * 三个量来自 task_gyro 的同一拍，所以 0x321 和 0x323 反映的是同一时刻。 */
+		/* 一次临界区取走同一拍的全部字段：角度、温度、滤波后角速度、
+		 * 原始码、采样时刻和零偏。task_gyro 在同一个临界区里发布这些量，
+		 * 所以任何一帧都不会拿到半新半旧的组合。 */
 		taskENTER_CRITICAL();
 		angleDegrees = gyroAccumulatedAngleDeg;
 		temperatureCelsius = gyroTempCelsius;
 		filteredRateDps = gyroRateFilteredDps;
+		biasDpsSnapshot = gyroBiasDps;
+		rawCodeSnapshot = gyroRawCode;
+		sampleTickMs = gyroSampleTickMs;
+		sampleSequence = gyroSampleSequence;
 		dataValid = gyroDataValid;
 		tempValid = gyroTempValid;
 		calibrationState = gyroCalibrationState;
@@ -1811,7 +2303,7 @@ static void task_can_tx(void const *argument)
 		}
 		if (zuptState != 0U)
 		{
-			/* bit4：零漂抑制判定为静止（角度已锁定，不再漂移） */
+			/* bit4 仅表示判定静止；bit6 指示此时是否仍连续积分。 */
 			statusFlags |= 0x10U;
 		}
 		if ((calibrationState == 2U) && (calibrationDegraded != 0U))
@@ -1820,6 +2312,9 @@ static void task_can_tx(void const *argument)
 			 * 角度照样有效，只是首次零偏精度略低于正常校准，静止后由慢跟踪继续收敛。 */
 			statusFlags |= 0x20U;
 		}
+#if (GYRO_ZUPT_FREEZE_ENABLE == 0U)
+		statusFlags |= 0x40U;
+#endif
 		sampleInterval = (intervalMs > 255U) ? 255U : (uint8_t)intervalMs;
 
 		payload[0] = (uint8_t)(angleBits & 0xFFU);
@@ -1832,7 +2327,8 @@ static void task_can_tx(void const *argument)
 		payload[7] = sampleInterval;
 
 		/* 帧 1：0x321 角度/温度/状态帧，DLC=8 */
-		if (CAN_SendFrame(CAN_GYRO_DATA_STD_ID, payload, CAN_GYRO_DATA_DLC) == HAL_OK)
+		if (CAN_SendFrameWait(CAN_GYRO_DATA_STD_ID, payload, CAN_GYRO_DATA_DLC,
+							 CAN_TX_MAILBOX_TIMEOUT_MS) == HAL_OK)
 		{
 			gyroCanTxOkCount++;
 		}
@@ -1841,13 +2337,14 @@ static void task_can_tx(void const *argument)
 			gyroCanTxErrCount++;
 		}
 
-		/* 帧 2：0x323 滤波后角速度帧，DLC=4，小端 int32，单位 0.001 °/s */
+		/* 帧 2：0x323 滤波后角速度帧，DLC=4，小端 int32，单位 0.00001 °/s */
 		ratePayload[0] = (uint8_t)(rateBits & 0xFFU);
 		ratePayload[1] = (uint8_t)((rateBits >> 8) & 0xFFU);
 		ratePayload[2] = (uint8_t)((rateBits >> 16) & 0xFFU);
 		ratePayload[3] = (uint8_t)((rateBits >> 24) & 0xFFU);
 
-		if (CAN_SendFrame(CAN_GYRO_RATE_STD_ID, ratePayload, CAN_GYRO_RATE_DLC) == HAL_OK)
+		if (CAN_SendFrameWait(CAN_GYRO_RATE_STD_ID, ratePayload, CAN_GYRO_RATE_DLC,
+							 CAN_TX_MAILBOX_TIMEOUT_MS) == HAL_OK)
 		{
 			gyroCanTxOkCount++;
 			gyroCanTxRateOkCount++;
@@ -1857,7 +2354,80 @@ static void task_can_tx(void const *argument)
 			gyroCanTxErrCount++;
 			gyroCanTxRateErrCount++;
 		}
-		osDelay(CAN_TX_PERIOD_MS);
+
+		/* 帧 3/4：原始采样帧 + 滤波明细帧，只在 task_gyro 产生了新样本时发送。
+		 * 读取失败的周期 sampleSequence 不变，这里就跳过，避免把上一拍的
+		 * 原始码/零偏/滤波值重复记成一条新记录（上位机按时间戳配对也依赖这一点）。
+		 * sampleSequence == 0 表示还没采到第一个样本（上电初期），此时不发。 */
+		if ((sampleSequence != 0U) && ((rawSnapshotSent == 0U) || (sampleSequence != lastRawSequence)))
+		{
+			if (rawSnapshotSent != 0U)
+			{
+				gyroCanSkippedSampleCount += (uint32_t)(sampleSequence - lastRawSequence) - 1U;
+			}
+			rawBits = (uint32_t)(uint16_t)rawCodeSnapshot;
+			tickBits = sampleTickMs;
+			/* 零偏按 0.001 °/s 编码（int16，可表示 ±32.767 °/s）。
+			 * 校准判据的均值上限是 ±40 °/s，可能超出日志编码范围；万一超限，
+			 * GyroScaleToInt16 会钳到 INT16_MIN/MAX，离线分析时以饱和值处理即可。 */
+			biasBits = (uint32_t)(uint16_t)GyroScaleToInt16(biasDpsSnapshot, CAN_GYRO_BIAS_SCALE);
+
+			/* 0x324：D0–D1 原始码 int16；D2–D5 采样时刻 uint32；D6–D7 零偏 int16 */
+			rawPayload[0] = (uint8_t)(rawBits & 0xFFU);
+			rawPayload[1] = (uint8_t)((rawBits >> 8) & 0xFFU);
+			rawPayload[2] = (uint8_t)(tickBits & 0xFFU);
+			rawPayload[3] = (uint8_t)((tickBits >> 8) & 0xFFU);
+			rawPayload[4] = (uint8_t)((tickBits >> 16) & 0xFFU);
+			rawPayload[5] = (uint8_t)((tickBits >> 24) & 0xFFU);
+			rawPayload[6] = (uint8_t)(biasBits & 0xFFU);
+			rawPayload[7] = (uint8_t)((biasBits >> 8) & 0xFFU);
+
+			rawSendStatus = CAN_SendFrameWait(CAN_GYRO_RAW_STD_ID, rawPayload,
+											 CAN_GYRO_RAW_DLC, CAN_TX_MAILBOX_TIMEOUT_MS);
+			if (rawSendStatus == HAL_OK)
+			{
+				gyroCanTxOkCount++;
+				gyroCanTxRawOkCount++;
+			}
+			else
+			{
+				gyroCanTxErrCount++;
+				gyroCanTxRawErrCount++;
+			}
+
+			/* 0x325：D0–D3 滤波后角速度 int32；D4–D7 采样时刻 uint32。
+			 * 时间戳与 0x324 相同，上位机据此把两帧配成一条完整记录。 */
+			detailPayload[0] = (uint8_t)(rateBits & 0xFFU);
+			detailPayload[1] = (uint8_t)((rateBits >> 8) & 0xFFU);
+			detailPayload[2] = (uint8_t)((rateBits >> 16) & 0xFFU);
+			detailPayload[3] = (uint8_t)((rateBits >> 24) & 0xFFU);
+			detailPayload[4] = (uint8_t)(tickBits & 0xFFU);
+			detailPayload[5] = (uint8_t)((tickBits >> 8) & 0xFFU);
+			detailPayload[6] = (uint8_t)((tickBits >> 16) & 0xFFU);
+			detailPayload[7] = (uint8_t)((tickBits >> 24) & 0xFFU);
+
+			detailSendStatus = CAN_SendFrameWait(CAN_GYRO_RAWDETAIL_STD_ID, detailPayload,
+												CAN_GYRO_RAWDETAIL_DLC, CAN_TX_MAILBOX_TIMEOUT_MS);
+			if (detailSendStatus == HAL_OK)
+			{
+				gyroCanTxOkCount++;
+				gyroCanTxRawOkCount++;
+			}
+			else
+			{
+				gyroCanTxErrCount++;
+				gyroCanTxRawErrCount++;
+			}
+
+			if ((rawSendStatus != HAL_OK) || (detailSendStatus != HAL_OK))
+			{
+				gyroCanRawPairDropCount++;
+			}
+			lastRawSequence = sampleSequence;
+			rawSnapshotSent = 1U;
+		}
+
+		vTaskDelayUntil(&lastWakeTick, periodTicks);
 	}
 }
 #endif

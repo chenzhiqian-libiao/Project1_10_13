@@ -31,6 +31,10 @@
 
 HAL_StatusTypeDef CAN_Init(void);
 HAL_StatusTypeDef CAN_SendFrame(uint16_t std_id, const uint8_t *data, uint8_t len);
+/* 有界等待空闲邮箱；需在 HAL tick 正常运行的任务上下文调用，不等待总线 ACK。
+ * timeoutMs=0 保持原非阻塞行为。 */
+HAL_StatusTypeDef CAN_SendFrameWait(uint16_t std_id, const uint8_t *data, uint8_t len,
+								   uint32_t timeoutMs);
 HAL_StatusTypeDef CAN_SendByte(uint8_t data);
 HAL_StatusTypeDef CAN_ReceiveFrame(uint16_t *std_id, uint8_t *data, uint8_t *len);
 HAL_StatusTypeDef CAN_ReceiveByte(uint8_t *data);
@@ -51,6 +55,8 @@ HAL_StatusTypeDef CAN_ReceiveByte(uint8_t *data);
                       一直为 0 = 收发器没供电（RXD 悬空）或总线被持续拉低 */
 extern volatile uint32_t canTxOkCount;
 extern volatile uint32_t canTxErrCount;
+extern volatile uint32_t canTxMailboxWaitCount;
+extern volatile uint32_t canTxMailboxTimeoutCount;
 extern volatile uint32_t canRxOkCount;
 extern volatile uint32_t canRxErrCount;
 extern volatile uint32_t canEsr;

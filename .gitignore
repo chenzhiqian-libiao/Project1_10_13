@@ -40,3 +40,13 @@ _tc_*
 *.pfx
 *.p12
 *.key
+
+# Local snapshots, published applications, and generated test data
+backup_*/
+publish/
+publish.*/
+publish_*/
+TestResults/
+__pycache__/
+*.pyc
+logs/

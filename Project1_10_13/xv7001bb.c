@@ -1,6 +1,10 @@
 #include "xv7001bb.h"
 #include "spi.h"
 
+volatile uint8_t xv7001bbFilterConfigOk = 0U;
+volatile uint8_t xv7001bbDspCtl1Readback = 0U;
+volatile uint8_t xv7001bbDspCtl2Readback = 0U;
+
 /* ===========================================================================
  * XV7001BB 陀螺仪驱动实现（器件层）
  * ---------------------------------------------------------------------------
@@ -310,6 +314,77 @@ HAL_StatusTypeDef XV7001bb_SetCalibCmd(uint8_t enable)
 	return XV7001bb_WriteData(XV7001BB_REG_DSPCTL3, value);
 }
 
+static HAL_StatusTypeDef XV7001bb_ConfigureMeasurementFilter(void)
+{
+	uint8_t dsp1;
+	uint8_t dsp2;
+	HAL_StatusTypeDef status;
+
+	xv7001bbFilterConfigOk = 0U;
+	xv7001bbDspCtl1Readback = 0U;
+	xv7001bbDspCtl2Readback = 0U;
+	status = XV7001bb_ReadReg(XV7001BB_REG_DSPCTL1, &dsp1);
+	if (status != HAL_OK)
+	{
+		return status;
+	}
+	dsp1 &= (uint8_t)~XV7001BB_DSPCTL1_ENABLE_HPF;
+	status = XV7001bb_WriteData(XV7001BB_REG_DSPCTL1, dsp1);
+	if (status != HAL_OK)
+	{
+		return status;
+	}
+
+	status = XV7001bb_ReadReg(XV7001BB_REG_DSPCTL2, &dsp2);
+	if (status != HAL_OK)
+	{
+		return status;
+	}
+	dsp2 &= (uint8_t)~XV7001BB_DSPCTL2_LPF_MASK;
+#if (XV7001BB_ANTIALIAS_ENABLE != 0U)
+	dsp2 |= XV7001BB_DSPCTL2_LPF_4TH_10HZ;
+#else
+	dsp2 |= XV7001BB_DSPCTL2_LPF_2ND_100HZ;
+#endif
+	status = XV7001bb_WriteData(XV7001BB_REG_DSPCTL2, dsp2);
+	if (status != HAL_OK)
+	{
+		return status;
+	}
+	status = XV7001bb_ResetDsp();
+	if (status != HAL_OK)
+	{
+		return status;
+	}
+
+	status = XV7001bb_ReadReg(XV7001BB_REG_DSPCTL1, &dsp1);
+	if (status != HAL_OK)
+	{
+		return status;
+	}
+	xv7001bbDspCtl1Readback = dsp1;
+	status = XV7001bb_ReadReg(XV7001BB_REG_DSPCTL2, &dsp2);
+	if (status != HAL_OK)
+	{
+		return status;
+	}
+	xv7001bbDspCtl2Readback = dsp2;
+	if ((dsp1 & XV7001BB_DSPCTL1_ENABLE_HPF) != 0U)
+	{
+		return HAL_ERROR;
+	}
+#if (XV7001BB_ANTIALIAS_ENABLE != 0U)
+	if ((dsp2 & XV7001BB_DSPCTL2_LPF_MASK) != XV7001BB_DSPCTL2_LPF_4TH_10HZ)
+#else
+	if ((dsp2 & XV7001BB_DSPCTL2_LPF_MASK) != XV7001BB_DSPCTL2_LPF_2ND_100HZ)
+#endif
+	{
+		return HAL_ERROR;
+	}
+	xv7001bbFilterConfigOk = 1U;
+	return HAL_OK;
+}
+
 /* ---------------------------------------------------------------------------
  * b) 初始化：整个上电流程按手册 Table 3.4 的时序走一遍
  *     第 1 步：等 tIF，刚上电时串口通信还没生效（手册要求 ≥1ms，这里等 10ms）
@@ -319,13 +394,15 @@ HAL_StatusTypeDef XV7001bb_SetCalibCmd(uint8_t enable)
  *             Sleep-out 把它拉到"001 = 正常工作态"
  *     第 4 步：关闭 I²C，只保留 4 线 SPI（IFCtl 的 bit0 必须写 0）
  *     第 5 步：设置角速度输出格式（16 bit + 使能角速度输出）
- *     第 6 步：等 tSTA（≤200ms），让角速度数据稳定下来
+ *     第 6 步：配置采样前低通、关闭高通，复位 DSP 并读回校验
+ *     第 7 步：等 tSTA（≤200ms），让角速度数据稳定下来
  * @retval HAL_OK 表示每一步的 SPI 通信都正常
  * --------------------------------------------------------------------------- */
 HAL_StatusTypeDef XV7001bb_Init(void)
 {
 	HAL_StatusTypeDef status;
 
+	xv7001bbFilterConfigOk = 0U;
 	/* 第 1 步：等串口通信生效 */
 	HAL_Delay(XV7001BB_T_IF_MS);
 
@@ -358,7 +435,13 @@ HAL_StatusTypeDef XV7001bb_Init(void)
 		return status;
 	}
 
-	/* 第 6 步：等传感器输出稳定 */
+	status = XV7001bb_ConfigureMeasurementFilter();
+	if (status != HAL_OK)
+	{
+		return status;
+	}
+
+	/* DSP 重置后重新等待稳定，再由采样任务做静止校准。 */
 	HAL_Delay(XV7001BB_T_STA_MS);
 
 	return HAL_OK;

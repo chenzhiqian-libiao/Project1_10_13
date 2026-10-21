@@ -58,6 +58,25 @@
 #define XV7001BB_OUTCTL1_SEL_RATE       0x01U   /* bit1:0 = 01：输出角速度数据  */
 #define XV7001BB_OUTCTL1_DEFAULT        0x01U   /* 复位后的默认值               */
 
+/* ---- DspCtl1/2 滤波设置（手册 Table 6.1 / 6.2） ------------------------- */
+#define XV7001BB_DSPCTL1_ENABLE_HPF 0x02U
+#define XV7001BB_DSPCTL2_LPF_MASK   0x3FU
+#define XV7001BB_DSPCTL2_LPF_4TH_10HZ 0x20U
+#define XV7001BB_DSPCTL2_LPF_2ND_100HZ 0x06U
+/* 在 MCU 的 100 Hz 读取之前抑制高频扰动；0 仅供旧带宽 A/B。
+ * 改变内部滤波后必须重新做静止校准并实测响应和返回残差。 */
+#ifndef XV7001BB_ANTIALIAS_ENABLE
+#define XV7001BB_ANTIALIAS_ENABLE 1U
+#endif
+#if (XV7001BB_ANTIALIAS_ENABLE > 1U)
+#error "XV7001BB_ANTIALIAS_ENABLE must be 0 or 1"
+#endif
+
+/* 初始化时读回；配置失败沿现有初始化错误路径停止，不以默认值继续测量。 */
+extern volatile uint8_t xv7001bbFilterConfigOk;
+extern volatile uint8_t xv7001bbDspCtl1Readback;
+extern volatile uint8_t xv7001bbDspCtl2Readback;
+
 /* ---- DspCtl3（0x03）DSP 设置 3（手册 Table 6.3） ------------------------- */
 #define XV7001BB_DSPCTL3_ENCALIBCMD 0x40U   /* bit6: 1 = 允许执行 AutoC 校准命令；
 												复位后默认 0，此时 AutoC 是空操作 */

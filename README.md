@@ -1,181 +1,28 @@
 # Project1_10_13
 
-STM32F103C8T6 + XV7001BB 陀螺仪固件工程，使用 Visual Studio、VisualGDB、STM32 HAL 和 FreeRTOS。
+STM32F103/XV7001BB firmware and the matching Windows desktop CAN application.
+This source snapshot was uploaded from the local `project_10_13` project on
+2026-10-21. The original firmware history is retained; firmware files now live
+under `Project1_10_13/` so the repository matches the local project layout.
 
-## 当前功能
+## Projects
 
-- SPI2 四线接口及 XV7001BB 寄存器读写、初始化、温度和角速度读取。
-- 目标周期 10 ms 的角速度采集、软件零偏校准、中值及低通滤波。
-- 静止判定（ZUPT）、偏置慢跟踪、静止角度保持及运动角度积分。
-- 经典 CAN 标准帧，1 Mbps，支持测量数据上传和清零/校准指令。
+- [Firmware source and operating notes](Project1_10_13/README.md)
+- [Visual Studio / VisualGDB solution](Project1_10_13/Project1_10_13.sln)
+- [Firmware main source](Project1_10_13/Project1_10_13.c)
+- [Windows desktop application and instructions](host_app/README.md)
+- [Desktop application project](host_app/src/GyroHost.App/GyroHost.App.csproj)
+- [Desktop application tests](host_app/tests/GyroHost.Tests/GyroHost.Tests.csproj)
 
-## 打开与构建
+The root Windows batch files launch or publish the desktop application.
+Building it requires the .NET 10 SDK. Firmware development uses the existing
+VisualGDB/Arm toolchain configuration; see the firmware instructions.
 
-1. 安装 Visual Studio、VisualGDB 和 ARM GCC 工具链。
-2. 在 VisualGDB 中安装本工程引用的 STM32 BSP：`com.sysprogs.arm.stm32`，工程记录版本为 `2020.01`。
-3. 打开 `Project1_10_13.sln`，按本机环境配置工具链和调试器，选择 Debug 或 Release 构建。
+Local caches, compiled binaries, published applications, duplicate backups,
+personal IDE settings, and credentials are not included.
+This is a source backup, not a full flash image backup.
 
-HAL、CMSIS、FreeRTOS、启动文件和链接脚本由 VisualGDB BSP 提供，不在本仓库内重复保存。首次在其他电脑打开时，需要先安装/匹配这些依赖。
-
-## 主要文件
-
-| 文件 | 用途 |
-|---|---|
-| `Project1_10_13.c` | 启动、模块开关、采样、校准、滤波、积分和 CAN 任务 |
-| `spi.c` / `spi.h` | SPI2 总线驱动与互斥 |
-| `xv7001bb.c` / `xv7001bb.h` | 陀螺仪功能接口和原始码换算 |
-| `can.c` / `can.h` | CAN 外设初始化和帧收发 |
-| `FreeRTOSConfig.h` | FreeRTOS 配置 |
-
-## 角速度换算（重要）
-
-`xv7001bb.h` 的 `XV7001BB_SCALE_16BIT` 取 **`70.0f`**，即 **70 LSB/(°/s)**。
-
-手册标称 16 bit 输出是 280 LSB/(°/s)，但本器件实测只有 70：转台精确转 90°，
-按 280 换算积分只得到 22.5°（正好差 4 倍），按 70 换算后 90°/180°/360° 的读数
-与真实角度一致。原因可能是器件的 16 bit 字为“14 bit 数据左对齐”（低 2 位恒 0）。
-
-早期固件为抵消这 4 倍，把积分系数 `GYRO_ANGLE_SCALE_CALIBRATION` 设成 `4.0f`；
-现在驱动直接按 70 换算，4 倍已撤销，该系数只留作角度标度细调。
-
-### 标度细调（`GYRO_ANGLE_SCALE_CALIBRATION`）
-
-角度积分还差一个**恒定的标度误差**，用 CSV 里的 `motor_angle_deg` 列当真值标定出来的。
-2026-10-20 两个数据文件共 **28 段 180° 行程**，模型 `M = s·G + c`（M = 电机角，无噪真值），
-最小化 `Σ(sG+c−M)²`：
-
-```text
-s = 1.00633 ± 0.00087   (7.2σ)      c = −0.042° ≈ 0
-```
-
-- 即陀螺**恒定读小 0.63%**：正转读小、反转也读小，28 段符号无一例外 → 纯标度误差。
-- 截距 `−0.042°` ≈ 0，没有固定偏置，所以只需一个乘性系数。
-- 效果：180° 行程的系统性少算 **1.15° → 去程残余 −0.003°、回程 +0.003°**。
-
-> **标定只能用"干净"的行程。** 同一文件里 6 段**连发**的 90° 行程（间隙 0.33 s，
-> 小于 `GYRO_ZUPT_CONFIRM_SAMPLES` 的 0.5 s 确认窗口，ZUPT 全程未重锁）多背了约
-> 0.4° 的自由积分零偏，其 `G/M = 0.9825` 明显低于 180° 段的 `0.9937`；把它们混进去
-> 会把标度估成 `1.0069`（偏大 0.06%）。以后重标定请确保**每段运动前留 ≥ 2 s 静止**。
-
-> `GYRO_ANGLE_SCALE_CALIBRATION` **不会**改善 180° 往返残差。无论是标度误差还是
-> 每次运动的固定损失，在去程/回程里都同号出现，相减时正好抵消；往返残差（σ≈1.4°）
-> 来自残余零偏（σ≈0.39 °/s），它在往返里**同向相加**，改这个常数动不了它。
-> 往返误差是纯随机的（均值 +0.08°），逐次不累积，要更准就多跑几个往返取平均
-> （σ → 1.4/√N）。
-
-> 更换器件或更换量程档位后必须重新标定这个常数，否则**所有以 °/s 为单位的阈值**都会失真。
-
-## 信号处理链
-
-```text
-SPI 原始码 ──/70──► measuredRateDps
-                        │
-                        ├─ 减 bias ──► correctedRateDps
-                        │
-                        ├─ ZUPT 静止判定（滞回：入场中值 + 出场原值）
-                        │      ├─ 判定静止 ──► bias 两级慢跟踪（τ≈4 s）、角度冻结
-                        │      └─ 判定运动 ──► 3 点中值 + 一阶低通（≈5 Hz）
-                        │
-                        └─ 梯形积分（冻结时不积分）──► 累计角度
-```
-
-主要参数（`Project1_10_13.c` 顶部）：
-
-| 宏 | 值 | 说明 |
-|---|---|---|
-| `GYRO_SAMPLE_PERIOD_MS` | 10 | 采样周期 |
-| `GYRO_CALIBRATION_SAMPLES` | 200 | 零偏校准样本数（2 s） |
-| `GYRO_LOWPASS_TAU_SECONDS` | 0.03183 | 一阶低通，约 5 Hz |
-| `GYRO_ZUPT_MAX_RATE_DPS` | 12.0 | 静止判据角速度门限（入场与出场共用，死区不因抗尖峰变大） |
-| `GYRO_ZUPT_CONFIRM_SAMPLES` | 50 | 入场：连续 50 拍（0.5 s）满足判据才确认静止 |
-| `GYRO_ZUPT_JUDGE_MEDIAN3` | 1 | 入场判据吃 3 拍中值（抗单拍 SPI 位错） |
-| `GYRO_ZUPT_JUDGE_HYSTERESIS` | 1 | 1 = 启用判据滞回（入场中值 / 出场原值） |
-| `GYRO_ZUPT_EXIT_FAST_DPS` | 24.0 | 出场 tier-1：单拍原值超此值立刻解锁 |
-| `GYRO_ZUPT_EXIT_CONFIRM_SAMPLES` | 2 | 出场 tier-2：连续 2 拍超 12 °/s 解锁 |
-| `GYRO_ZUPT_RAMP_RECOVER_ENABLE` | 1 | 起步坡道补偿：解锁时把冻结期间最后 0.25 s 的角度补回 |
-| `GYRO_ZUPT_RAMP_RECOVER_SAMPLES` | 25 | 补偿环形缓冲长度（10 ms × 25 = 0.25 s） |
-| `GYRO_ZUPT_RAMP_RECOVER_MIN_DEG` | 0.02 | 补回量小于此值判为噪声，不补 |
-| `GYRO_BIAS_TRACK_GAIN` | 0.0025 | 零偏慢跟踪外层（τ≈4 s） |
-| `GYRO_BIAS_TRACK_AVG_GAIN` | 0.02 | 零偏慢跟踪内层平滑（τ≈0.5 s） |
-| `GYRO_ANGLE_SCALE_CALIBRATION` | 1.0063 | 标度细调，按实测角度残差标定（见上文「标度细调」） |
-
-### 静止判据的滞回（ZUPT）
-
-入场和出场必须用不同的信号，否则总有一头吃亏：
-
-| 方案 | 抗单拍尖峰 | 退出延迟 | 结果 |
-|---|---|---|---|
-| 只用中值 | 是 | 晚 1 拍 | 200 °/s 快转启动丢 `0.01 s × 200 = 2°` |
-| 只用原值 | 否 | 0 | bit10 位错（14.6 °/s）打断 0.5 s 确认窗口 |
-| **滞回（当前）** | **是** | **0** | 两边的损失都消掉 |
-
-- **入场**：`|3 拍中值| <= 12 °/s` 连续 50 拍 → 锁定。
-- **出场 tier-1**：单拍 `|原值| > 24 °/s` → 立刻解锁（0 拍丢失）。
-  24 °/s 是给实测 bit10 位错 14.6 °/s 留的 1.6 倍余量。
-- **出场 tier-2**：连续 2 拍 `|原值| > 12 °/s` → 解锁（丢 1 拍即 10 ms，
-  在 12~24 °/s 区间最多 0.24°，可忽略）。
-
-### 起步坡道补偿
-
-锁定期间角度被冻结，但平台不是瞬间停下的：从静止起转时，角速度从 0 升到
-判据门限之前的那一段全落在锁定区间里，被整段丢掉。设加速度 `a`：
-
-```text
-丢失角度 ≈ 门限² / (2a)
-上位机默认参数 100 mm/s、500 mm/s²、D = 100 mm
-  → 角速度 ≈ 114.6 °/s，角加速度 ≈ 573 °/s²
-  → tier-1（24 °/s）解锁时丢 24²/(2×573) ≈ 0.50°
-```
-
-这个损失**只出现在每段运动的起点**（终点减速时 ZUPT 要连续 50 拍不超阈值
-才锁定，减速坡道早积进去了），所以它是有方向的。往返时去程与回程各丢一次、
-方向相反，两者会部分抵消，最终误差因此取决于远端是否重新锁定 —— 而重锁
-只看远端停顿是否超过 0.5 s。补偿的目的就是把误差与"停多久"解耦：
-
-- 锁定期间把"本来会积进去"的增量（与积分分支用逐字相同的梯形公式）存进
-  0.25 s 环形缓冲；
-- 解锁的那一刻（`zuptActive` 1→0），把缓冲里的和补回 `accumulatedAngleDeg`；
-- 补回量小于 0.02° 时不补：静止时 0.25 s 的冻结积分只有 `残余零偏 × 0.25 s ≈ 0.002°`，
-  不会污染 `0.00000°` 的静止显示。
-
-观察量：`gyroDbgRampRecoverCount`（补偿次数）、`gyroDbgRampRecoverDegSum`
-（累计补回角度）。一轮 90° 往返应看到 Count 增加 1~2、DegSum 增加 0.1~0.5°；
-若 Count 从不增长，说明坡道整段落在 0.25 s 缓冲之外（加速度偏低）。
-
-调试统计开关 `GYRO_ZUPT_DEBUG_STATS_ENABLE` 默认 `1U`，发布前应改回 `0U`
-（关闭后相关全局量和统计代码不参与编译）。
-
-## 应用层 CAN 协议
-
-所有多字节载荷字段采用小端序，有符号整数，以实际源码为准。
-
-| 标准 ID | DLC | 载荷 |
-|---|---|---|
-| `0x321` | 8 | D0–D3：int32 累计角度 × 100000（°）；D4–D5：int16 温度 × 100（℃）；D6：状态位；D7：采样间隔（ms，最大 255） |
-| `0x323` | 4 | D0–D3：int32 滤波后角速度 × 100000（°/s） |
-| `0x322` | 1 | `01`：请求重新零偏校准；`02`：请求角度清零 |
-
-`0x321` 的 D6：
-
-| bit | 含义 |
-|---|---|
-| 0 | 角度/采样有效（含校准完成条件） |
-| 1 | 温度有效 |
-| 2 | 校准完成 |
-| 3 | 校准失败（会自动重试） |
-| 4 | 零漂抑制判定为静止（角度已锁定） |
-| 5 | 校准为降级模式（峰峰值超限但均值可用） |
-
-数据每 10 ms 上传一帧（0x321 与 0x323 严格同源，来自同一次临界区快照），
-温度约每 1 s 读取。重新校准时应保持板子静止。上位机直接解析板端角度，不做额外比例修正。
-
-> 上报周期由 `CAN_TX_PERIOD_MS` 决定。2026-10-20 由 100 ms 改为 10 ms：
-> 积分本来就在 100 Hz 跑，10 Hz 上报会把加速/减速坡道压成 1~2 个点，
-> 起动与停止丢掉的那 0.2~0.5° 在曲线上看不出来。1 Mbps 下两帧/10 ms ≈ 26 kbit/s，占用可忽略。
-
-## 保存范围
-
-本仓库保存 `Project1_10_13` 固件目录及其中的参考 PDF，未包含同级 `host_app` 上位机目录。
-
-编译产物、Visual Studio/VisualGDB 缓存、跟踪记录、个人 `.user` 文件和本地临时快照
-（`*.bak_*`）由 `.gitignore` 排除。
+The separate `gyro_project` browser-based handoff is not included here.
+Its `0x600/0x601` sensor protocol is different from this project's
+`0x321/0x323` protocol. Uploading these files does not flash hardware or
+validate motor operation, calibration quality, or physical accuracy.
